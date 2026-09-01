@@ -1,15 +1,5 @@
 {
-  "active": [
-    {
-      "id": "A04F3A8E",
-      "symbol": "BTCUSDT",
-      "direction": "LONG",
-      "leverage": 50.0,
-      "entry_price": 77418.27,
-      "notional": 500.0,
-      "entry_time": "2026-08-30 23:51:13 UTC"
-    }
-  ],
+  "active": [],
   "history": [
     {
       "id": "22FF1533",
@@ -197,6 +187,33 @@
       "close_time": "2026-08-30 23:54:31 UTC",
       "pnl_pct": -64.58,
       "pnl_usd": -645.79
+    },
+    {
+      "id": "A04F3A8E",
+      "symbol": "BTCUSDT",
+      "direction": "LONG",
+      "leverage": 50.0,
+      "entry_price": 77418.27,
+      "notional": 500.0,
+      "entry_time": "2026-08-30 23:51:13 UTC",
+      "warning_triggered": true,
+      "close_price": 77077.69,
+      "close_time": "2026-09-01 21:12:57 UTC",
+      "pnl_pct": -22.0,
+      "pnl_usd": -109.98
+    },
+    {
+      "id": "D29CC9AF",
+      "symbol": "BTCUSDT",
+      "direction": "LONG",
+      "leverage": 10,
+      "entry_price": 78000.0,
+      "notional": 1000.0,
+      "entry_time": "2026-09-01 22:04:15 UTC",
+      "close_price": 80000.0,
+      "close_time": "2026-09-01 22:04:15 UTC",
+      "pnl_pct": 25.64,
+      "pnl_usd": 256.41
     }
   ]
 }

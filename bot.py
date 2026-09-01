@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import sys
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -11,10 +12,10 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
 import requests
+from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from telegram.ext import (
@@ -28,6 +29,22 @@ from telegram.ext import (
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+keepalive_app = Flask(__name__)
+
+
+@keepalive_app.route("/")
+def keepalive_home():
+    return "ARIA Crypto Engine is running."
+
+
+@keepalive_app.route("/health")
+def keepalive_health():
+    return "OK", 200
+
+
+def run_flask():
+    keepalive_app.run(host="0.0.0.0", port=10000)
+
 BASE_URL = "https://api.binance.com/api/v3/klines"
 LOG_FILE = "signals_log.json"
 TRADES_FILE = "paper_trades.json"
@@ -35,11 +52,6 @@ WHALES_FILE = "whales_log.json"
 ALERTS_FILE = "alerts_log.json"
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
 TIMEOUT = 10
-
-GITHUB_TOKEN = "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"
-GIST_ID = "489ef37dbce108d43823515134248336"
-
-WEBAPP_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "XRPUSDT"]
 
 WHALE_USD_THRESHOLD = 5_000_000
 VOLUME_SPIKE_RATIO = 5.0
@@ -550,6 +562,18 @@ def format_position_alert(trade, symbol, price, signal, confidence):
     )
 
 
+def format_liquidation_alert(trade, live_price):
+    display = trade["symbol"].replace("USDT", "/USDT")
+    return (
+        "💀 <b>LIQUIDATION ALERT!</b> 💀\n\n"
+        f"<b>Trade ID:</b> #{trade['id']} ({trade['direction']} {display})\n"
+        f"<b>Liquidation Price:</b> ${live_price:,.2f}\n"
+        f"<b>Final P&L:</b> {trade['pnl_pct']:+.2f}% (${trade['pnl_usd']:+,.2f})\n\n"
+        f"<i>Your margin has been fully exhausted and the position was "
+        f"forcefully closed by the engine.</i>"
+    )
+
+
 async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
     data = load_trades()
     active = data.get("active", [])
@@ -558,8 +582,27 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
 
     changed = False
 
-    for trade in active:
+    for trade in list(active):
         symbol = trade["symbol"]
+
+        live_price = get_price(symbol)
+        if live_price is not None:
+            pnl_pct, _ = calc_pnl(trade, live_price)
+            if pnl_pct <= -100.0:
+                trade_id = trade["id"]
+                finalize_trade(trade, live_price)
+                data["active"].remove(trade)
+                data["history"].append(trade)
+                changed = True
+
+                message = format_liquidation_alert(trade, live_price)
+                try:
+                    await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML")
+                    print(f"💀 Liquidation alert sent for trade {trade_id}")
+                except Exception as exc:
+                    print(f"❌ ERROR sending liquidation alert for {trade_id}: {exc}")
+                continue
+
         df = fetch_klines(symbol, interval="15m", limit=300)
         if df.empty:
             continue
@@ -607,142 +650,6 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
 
     if changed:
         save_trades(data)
-
-
-def fetch_ticker_24h(symbol):
-    """Fetch 24h ticker statistics for a single symbol from Binance."""
-    try:
-        response = requests.get(
-            "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": symbol},
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as exc:
-        print(f"❌ ERROR: Failed to fetch 24h ticker for {symbol} — {exc}")
-        return None
-
-    try:
-        return {
-            "symbol": data["symbol"],
-            "lastPrice": float(data["lastPrice"]),
-            "priceChangePercent": float(data["priceChangePercent"]),
-            "highPrice": float(data["highPrice"]),
-            "lowPrice": float(data["lowPrice"]),
-            "volume": float(data["volume"]),
-        }
-    except (KeyError, ValueError, TypeError):
-        return None
-
-
-def analyze_for_webapp(symbol):
-    df = fetch_klines(symbol, interval="1h", limit=300)
-    if df.empty:
-        return None
-
-    closes = df["Close"].to_numpy()
-    price = float(closes[-1])
-    rsi = calculate_rsi(closes)
-    macd_info = calculate_macd(closes)
-    boll = calculate_bollinger(closes)
-    ema200 = calculate_ema(closes, 200)
-    ema200_last = ema200[-1] if ema200 else None
-
-    signal, confidence, _, _ = compute_consensus(price, rsi, macd_info, boll, ema200_last)
-
-    return {
-        "symbol": symbol,
-        "signal": signal,
-        "confidence": confidence,
-        "rsi": round(rsi, 2) if rsi is not None else None,
-        "ema200": round(ema200_last, 2) if ema200_last is not None else None,
-        "macd_cross": macd_info["cross"],
-    }
-
-
-def _fetch_rss_news_sync(limit=5):
-    headers = {"User-Agent": "Mozilla/5.0 (crypto-bot)"}
-    articles = []
-    for source_name, url in RSS_FEEDS:
-        try:
-            response = requests.get(url, headers=headers, timeout=TIMEOUT)
-            response.raise_for_status()
-            articles.extend(_parse_rss_feed(response.text, source_name))
-        except Exception as exc:
-            print(f"❌ ERROR: RSS feed {source_name} failed — {exc}")
-    return articles[:limit]
-
-
-def generate_webapp_data():
-    data = {
-        "prices": [],
-        "signals": [],
-        "fear_greed": {},
-        "whales": [],
-        "news": [],
-        "portfolio": [],
-        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-    }
-
-    for symbol in WEBAPP_SYMBOLS:
-        ticker = fetch_ticker_24h(symbol)
-        if ticker:
-            data["prices"].append(ticker)
-
-        signal = analyze_for_webapp(symbol)
-        if signal:
-            data["signals"].append(signal)
-
-    value, classification = fetch_fear_greed()
-    data["fear_greed"] = {"value": value, "classification": classification}
-
-    data["whales"] = load_whales()[-10:]
-
-    data["news"] = _fetch_rss_news_sync(5)
-
-    data["portfolio"] = load_trades().get("active", [])
-
-    return json.dumps(data, ensure_ascii=False, indent=2)
-
-
-def _is_gist_configured():
-    return "INSERT" not in GITHUB_TOKEN and "INSERT" not in GIST_ID
-
-
-def upload_to_gist(data_json):
-    if not _is_gist_configured():
-        return
-
-    url = f"https://api.github.com/gists/{GIST_ID}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/vnd.github+json",
-    }
-    body = {"files": {"webapp_data.json": {"content": data_json}}}
-
-    try:
-        response = requests.patch(url, headers=headers, json=body, timeout=TIMEOUT)
-        response.raise_for_status()
-        print(f"✅ Gist uploaded successfully ({len(data_json)} bytes).")
-    except requests.exceptions.Timeout:
-        print("⏱️  TIMEOUT: Gist upload timed out.")
-    except requests.exceptions.RequestException as exc:
-        print(f"❌ ERROR: Gist upload failed — {exc}")
-
-
-async def webapp_data_loop(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data_json = await asyncio.to_thread(generate_webapp_data)
-    except Exception as exc:
-        print(f"❌ ERROR generating webapp data: {exc}")
-        return
-
-    try:
-        await asyncio.to_thread(upload_to_gist, data_json)
-    except Exception as exc:
-        print(f"❌ ERROR in gist upload: {exc}")
 
 
 async def fetch_crypto_news(symbol, limit=3):
@@ -1067,18 +974,22 @@ def calc_pnl(trade, current_price):
     return pnl_frac * 100, trade["notional"] * pnl_frac
 
 
+def finalize_trade(trade, current_price):
+    pnl_pct, pnl_usd = calc_pnl(trade, current_price)
+    trade["close_price"] = current_price
+    trade["close_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    trade["pnl_pct"] = round(pnl_pct, 2)
+    trade["pnl_usd"] = round(pnl_usd, 2)
+    return trade
+
+
 def close_trade(trade_id, current_price):
     data = load_trades()
     trade = next((t for t in data["active"] if t["id"] == trade_id), None)
     if trade is None:
         return None
 
-    pnl_pct, pnl_usd = calc_pnl(trade, current_price)
-    trade["close_price"] = current_price
-    trade["close_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    trade["pnl_pct"] = round(pnl_pct, 2)
-    trade["pnl_usd"] = round(pnl_usd, 2)
-
+    finalize_trade(trade, current_price)
     data["active"] = [t for t in data["active"] if t["id"] != trade_id]
     data["history"].append(trade)
     save_trades(data)
@@ -2349,8 +2260,9 @@ def main():
     application.job_queue.run_repeating(whale_tracker_loop, interval=120, first=10)
     application.job_queue.run_repeating(check_price_alerts, interval=30, first=5)
     application.job_queue.run_repeating(position_monitor_loop, interval=60, first=15)
-    application.job_queue.run_repeating(webapp_data_loop, interval=60, first=5)
 
+    threading.Thread(target=run_flask, daemon=True).start()
+    print("🌐 Flask server started on port 10000")
     print("🤖 Telegram Bot is online and listening...")
     application.run_polling()
 
