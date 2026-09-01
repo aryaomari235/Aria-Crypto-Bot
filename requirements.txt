@@ -5,3 +5,4 @@ mplfinance
 python-telegram-bot[job-queue]
 google-generativeai
 textblob
+flask
