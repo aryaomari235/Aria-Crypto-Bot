@@ -45,7 +45,7 @@ def keepalive_health():
 def run_flask():
     keepalive_app.run(host="0.0.0.0", port=10000)
 
-BASE_URL = "https://api.binance.com/api/v3/klines"
+BASE_URL = "https://data-api.binance.vision/api/v3/klines"
 LOG_FILE = "signals_log.json"
 TRADES_FILE = "paper_trades.json"
 WHALES_FILE = "whales_log.json"
@@ -58,9 +58,9 @@ VOLUME_SPIKE_RATIO = 5.0
 VOLUME_AVG_PERIOD = 20
 
 RSS_FEEDS = [
-    ("ارزدیجیتال", "https://arzdigital.com/feed/"),
-    ("زوماقیمت", "https://zoomarz.com/feed/"),
-    ("میهن بلاکچین", "https://mihanblockchain.com/feed/"),
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("Bitcoin Magazine", "https://bitcoinmagazine.com/feed"),
 ]
 
 SENTIMENT_EMOJI = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}
@@ -73,8 +73,14 @@ FEAR_GREED_EMOJI = {
     "Extreme Greed": "🤩",
 }
 
-BULLISH_WORDS = ["صعود", "رشد", "افزایش", "پامپ", "خرید", "رکورد", "مثبت", "حمایت"]
-BEARISH_WORDS = ["سقوط", "ریزش", "کاهش", "دامپ", "فروش", "منفی", "مقاومت", "خطر"]
+BULLISH_WORDS = [
+    "bull", "bullish", "soar", "surge", "rally", "gain", "record",
+    "breakout", "adoption", "buy", "upgrade", "inflows", "approval",
+]
+BEARISH_WORDS = [
+    "bear", "bearish", "drop", "crash", "sell", "fall", "plunge",
+    "ban", "lawsuit", "crackdown", "loss", "hack", "outflows", "downgrade",
+]
 
 TELEGRAM_TOKEN = "8877914394:AAHSPfZx3x2E2qQl929LedIj9NTfUnwgaMw"
 CHAT_ID = "758980281"
@@ -87,16 +93,16 @@ SYMBOL_DISPLAY = {s: s.replace("USDT", "/USDT") for s in SUPPORTED_SYMBOLS}
 SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
 
 SYMBOL_KEYWORDS = {
-    "BTCUSDT": ["btc", "bitcoin", "بیت کوین", "بیت‌کوین", "بیتکوین"],
-    "ETHUSDT": ["eth", "ethereum", "اتریوم"],
-    "SOLUSDT": ["سولانا", "Solana", "SOL"],
-    "DOGEUSDT": ["دوج", "دوج‌کوین", "Doge", "DOGE"],
-    "XRPUSDT": ["ریپل", "Ripple", "XRP"],
-    "ADAUSDT": ["کاردانو", "Cardano", "ADA"],
-    "BNBUSDT": ["بایننس", "Binance", "BNB"],
-    "DOTUSDT": ["پولکادات", "Polkadot", "DOT"],
-    "LINKUSDT": ["چین لینک", "چین‌لینک", "Chainlink", "LINK"],
-    "LTCUSDT": ["لایت کوین", "Litecoin", "LTC"],
+    "BTCUSDT": ["btc", "bitcoin"],
+    "ETHUSDT": ["eth", "ethereum"],
+    "SOLUSDT": ["sol", "solana"],
+    "DOGEUSDT": ["doge", "dogecoin"],
+    "XRPUSDT": ["xrp", "ripple"],
+    "ADAUSDT": ["ada", "cardano"],
+    "BNBUSDT": ["bnb", "binance"],
+    "DOTUSDT": ["dot", "polkadot"],
+    "LINKUSDT": ["link", "chainlink"],
+    "LTCUSDT": ["ltc", "litecoin"],
 }
 
 SIGNAL_EMOJI = {
@@ -801,29 +807,30 @@ def _relative_time(date_str):
 
 
 def analyze_sentiment_with_ai(news_text):
-    """Analyze news sentiment using Persian keyword matching."""
-    bullish_count = sum(news_text.count(word) for word in BULLISH_WORDS)
-    bearish_count = sum(news_text.count(word) for word in BEARISH_WORDS)
+    """Analyze English news sentiment using keyword matching."""
+    text = news_text.lower()
+    bullish_count = sum(text.count(word) for word in BULLISH_WORDS)
+    bearish_count = sum(text.count(word) for word in BEARISH_WORDS)
 
     if bullish_count > bearish_count:
         return {
             "sentiment": "BULLISH",
-            "reason": f"بیشتر اخبار شامل واژه‌های مثبت هستند (مثبت {bullish_count}، منفی {bearish_count}).",
+            "reason": f"Headlines contain predominantly bullish keywords (bullish {bullish_count}, bearish {bearish_count}).",
         }
     if bearish_count > bullish_count:
         return {
             "sentiment": "BEARISH",
-            "reason": f"اخبار عمدتاً شامل واژه‌های منفی هستند (منفی {bearish_count}، مثبت {bullish_count}).",
+            "reason": f"Headlines contain predominantly bearish keywords (bearish {bearish_count}, bullish {bullish_count}).",
         }
     return {
         "sentiment": "NEUTRAL",
-        "reason": f"ترکیبی از واژه‌های مثبت و منفی بدون جهت‌گیری مشخص (مثبت {bullish_count}، منفی {bearish_count}).",
+        "reason": f"Mixed or neutral headlines with no strong directional signal (bullish {bullish_count}, bearish {bearish_count}).",
     }
 
 
 def build_news_message(base, articles, sentiment, matched=True):
     emoji = SENTIMENT_EMOJI.get(sentiment["sentiment"], "🟡")
-    lines = [f"📰 <b>اخبار بازار ارز دیجیتال — {base}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    lines = [f"📰 <b>MARKET NEWS — {base}</b>", "━━━━━━━━━━━━━━━━━━━━"]
 
     if not matched:
         lines.append(f"ℹ️ <i>No specific news found for {base}. Showing latest market news:</i>")
@@ -836,8 +843,8 @@ def build_news_message(base, articles, sentiment, matched=True):
         lines.append(f"   📰 {article['source']} • 🕒 {article.get('published', 'Recently')}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📰 <b>تحلیل احساسات بازار:</b> {sentiment['sentiment']} {emoji}")
-    lines.append(f"🧠 <b>دیدگاه تحلیلگر:</b> {sentiment['reason']}")
+    lines.append(f"📰 <b>AI Market Sentiment:</b> {sentiment['sentiment']} {emoji}")
+    lines.append(f"🧠 <b>AI Analyst View:</b> {sentiment['reason']}")
     return "\n".join(lines)
 
 
