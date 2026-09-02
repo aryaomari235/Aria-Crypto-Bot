@@ -330,31 +330,56 @@ def detect_candlestick_pattern(df):
     return None
 
 
-def compute_consensus(price, rsi, macd_info, boll, adx=None, vol_ok=False, pattern=None):
+def compute_consensus(price, rsi, macd_info, boll, ema50, ema200, vol_ok=False, pattern=None):
     """Dynamic weighted consensus engine.
 
-    Scores: RSI ±2, MACD cross ±2, Bollinger touch ±1, candlestick ±2.
-    Volume confirmation amplifies the net score; ADX gates STRONG signals.
+    Each indicator contributes fairly; volume confirmation nudges the leading
+    side by +1 instead of multiplying the whole score.
     """
     bullish = 0
     bearish = 0
 
+    # RSI
     if rsi is not None:
-        if rsi <= 30:
+        if rsi <= 35:
             bullish += 2
-        elif rsi >= 70:
+        elif rsi <= 45:
+            bullish += 1
+        elif rsi >= 65:
             bearish += 2
+        elif rsi >= 55:
+            bearish += 1
 
+    # MACD cross + histogram
     if macd_info["cross"] == "BULLISH":
         bullish += 2
     elif macd_info["cross"] == "BEARISH":
         bearish += 2
+    if macd_info["histogram"] is not None:
+        if macd_info["histogram"] > 0:
+            bullish += 1
+        elif macd_info["histogram"] < 0:
+            bearish += 1
 
+    # Bollinger Bands
     if boll["lower"] is not None and price <= boll["lower"]:
-        bullish += 1
+        bullish += 2
     if boll["upper"] is not None and price >= boll["upper"]:
-        bearish += 1
+        bearish += 2
 
+    # EMA trend
+    if ema50 is not None:
+        if price > ema50:
+            bullish += 1
+        else:
+            bearish += 1
+    if ema200 is not None:
+        if price > ema200:
+            bullish += 1
+        else:
+            bearish += 1
+
+    # Candlestick pattern
     if pattern in ("bullish_engulfing", "hammer"):
         bullish += 2
     elif pattern in ("bearish_engulfing", "shooting_star"):
@@ -362,35 +387,25 @@ def compute_consensus(price, rsi, macd_info, boll, adx=None, vol_ok=False, patte
 
     net = bullish - bearish
 
-    # Volume confirmation: amplify or dampen signal strength
+    # Volume confirmation: add +1 to the leading side
     if vol_ok:
-        net = int(net * 1.5)
+        if net > 0:
+            net += 1
+        elif net < 0:
+            net -= 1
+
+    if net >= 4:
+        signal = "STRONG BUY"
+    elif net >= 2:
+        signal = "BUY"
+    elif net <= -4:
+        signal = "STRONG SELL"
+    elif net <= -2:
+        signal = "SELL"
     else:
-        net = int(net * 0.5)
+        signal = "HOLD"
 
-    trending = adx is not None and adx >= 20
-
-    if trending and vol_ok:
-        if net >= 6:
-            signal = "STRONG BUY"
-        elif net >= 3:
-            signal = "BUY"
-        elif net <= -6:
-            signal = "STRONG SELL"
-        elif net <= -3:
-            signal = "SELL"
-        else:
-            signal = "HOLD"
-    else:
-        # Ranging market or no volume confirmation -> no strong signals
-        if net >= 3:
-            signal = "BUY"
-        elif net <= -3:
-            signal = "SELL"
-        else:
-            signal = "HOLD"
-
-    confidence = min(100, round(50 + abs(net) * 6))
+    confidence = min(98, max(50, round(50 + abs(net) * 8)))
     return signal, confidence, bullish, bearish
 
 
@@ -411,8 +426,11 @@ def analyze_indicators(df):
     vol_ok = volume_confirmation(df)
     pattern = detect_candlestick_pattern(df)
 
+    ema50_last = ema50[-1] if ema50 else None
+    ema200_last = ema200[-1] if ema200 else None
+
     signal, confidence, bullish, bearish = compute_consensus(
-        price, rsi, macd_info, boll, adx, vol_ok, pattern
+        price, rsi, macd_info, boll, ema50_last, ema200_last, vol_ok, pattern
     )
 
     return {
@@ -420,8 +438,8 @@ def analyze_indicators(df):
         "rsi": rsi,
         "macd": macd_info,
         "boll": boll,
-        "ema50": ema50[-1] if ema50 else None,
-        "ema200": ema200[-1] if ema200 else None,
+        "ema50": ema50_last,
+        "ema200": ema200_last,
         "atr": atr,
         "adx": adx,
         "vol_ok": vol_ok,
@@ -1671,7 +1689,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption, chart, log_entry = result
     save_log(log_entry)
-    await update.message.reply_photo(photo=chart, filename=chart.name, caption=caption, parse_mode="HTML")
+    await update.message.reply_photo(photo=chart, caption=caption, parse_mode="HTML")
 
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2276,7 +2294,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             caption, chart, log_entry = result
             save_log(log_entry)
-            await query.message.reply_photo(photo=chart, filename=chart.name, caption=caption, parse_mode="HTML")
+            await query.message.reply_photo(photo=chart, caption=caption, parse_mode="HTML")
 
         elif data.startswith("trade:"):
             symbol = data.split(":", 1)[1]
