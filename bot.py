@@ -12,6 +12,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
 import requests
@@ -231,46 +232,263 @@ def calculate_bollinger(closes, period=20, std=2):
     }
 
 
-def compute_consensus(price, rsi, macd_info, boll, ema200):
-    """Combine indicators into a consensus signal and confidence score."""
+def calculate_atr(df, period=14):
+    """Calculate the Average True Range (latest value)."""
+    if df.empty or len(df) < period + 1:
+        return None
+
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    return float(atr.iloc[-1])
+
+
+def calculate_adx(df, period=14):
+    """Calculate the Average Directional Index (latest value)."""
+    if df.empty or len(df) < period * 2:
+        return None
+
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
+    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
+
+    tr = pd.concat(
+        [(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return float(adx.iloc[-1])
+
+
+def volume_confirmation(df, period=20, multiplier=1.5):
+    """Return True if latest volume exceeds `multiplier` * SMA(volume)."""
+    if df.empty or len(df) < period + 1:
+        return False
+
+    volumes = df["Volume"]
+    sma_volume = volumes.rolling(window=period).mean()
+    avg = float(sma_volume.iloc[-1])
+    if avg <= 0:
+        return False
+    return float(volumes.iloc[-1]) > multiplier * avg
+
+
+def detect_candlestick_pattern(df):
+    """Detect basic patterns on the last closed candle."""
+    if df.empty or len(df) < 2:
+        return None
+
+    o = df["Open"].to_numpy()
+    h = df["High"].to_numpy()
+    l = df["Low"].to_numpy()
+    c = df["Close"].to_numpy()
+
+    open1, close1 = o[-1], c[-1]
+    high1, low1 = h[-1], l[-1]
+    open0, close0 = o[-2], c[-2]
+
+    body1 = abs(close1 - open1)
+    body0 = abs(close0 - open0)
+
+    # Engulfing patterns
+    if close0 < open0 and close1 > open1 and close1 >= open0 and open1 <= close0:
+        return "bullish_engulfing"
+    if close0 > open0 and close1 < open1 and close1 <= open0 and open1 >= close0:
+        return "bearish_engulfing"
+
+    # Hammer / Shooting Star
+    if body1 == 0:
+        return None
+    lower_wick = min(open1, close1) - low1
+    upper_wick = high1 - max(open1, close1)
+
+    if lower_wick >= 2 * body1 and upper_wick <= body1:
+        return "hammer"
+    if upper_wick >= 2 * body1 and lower_wick <= body1:
+        return "shooting_star"
+
+    return None
+
+
+def compute_consensus(price, rsi, macd_info, boll, adx=None, vol_ok=False, pattern=None):
+    """Dynamic weighted consensus engine.
+
+    Scores: RSI ±2, MACD cross ±2, Bollinger touch ±1, candlestick ±2.
+    Volume confirmation amplifies the net score; ADX gates STRONG signals.
+    """
     bullish = 0
     bearish = 0
 
-    if rsi is not None and rsi <= 30:
-        bullish += 1
-    if rsi is not None and rsi >= 70:
-        bearish += 1
+    if rsi is not None:
+        if rsi <= 30:
+            bullish += 2
+        elif rsi >= 70:
+            bearish += 2
 
     if macd_info["cross"] == "BULLISH":
+        bullish += 2
+    elif macd_info["cross"] == "BEARISH":
+        bearish += 2
+
+    if boll["lower"] is not None and price <= boll["lower"]:
         bullish += 1
-    if macd_info["cross"] == "BEARISH":
+    if boll["upper"] is not None and price >= boll["upper"]:
         bearish += 1
 
-    if boll["lower"] is not None and price < boll["lower"]:
-        bullish += 1
-    if boll["upper"] is not None and price > boll["upper"]:
-        bearish += 1
-
-    if ema200 is not None and price > ema200:
-        bullish += 1
-    if ema200 is not None and price < ema200:
-        bearish += 1
+    if pattern in ("bullish_engulfing", "hammer"):
+        bullish += 2
+    elif pattern in ("bearish_engulfing", "shooting_star"):
+        bearish += 2
 
     net = bullish - bearish
 
-    if net >= 3:
-        signal = "STRONG BUY"
-    elif net >= 1:
-        signal = "BUY"
-    elif net <= -3:
-        signal = "STRONG SELL"
-    elif net <= -1:
-        signal = "SELL"
+    # Volume confirmation: amplify or dampen signal strength
+    if vol_ok:
+        net = int(net * 1.5)
     else:
-        signal = "HOLD"
+        net = int(net * 0.5)
 
-    confidence = min(100, round(50 + abs(net) * 12.5))
+    trending = adx is not None and adx >= 20
+
+    if trending and vol_ok:
+        if net >= 6:
+            signal = "STRONG BUY"
+        elif net >= 3:
+            signal = "BUY"
+        elif net <= -6:
+            signal = "STRONG SELL"
+        elif net <= -3:
+            signal = "SELL"
+        else:
+            signal = "HOLD"
+    else:
+        # Ranging market or no volume confirmation -> no strong signals
+        if net >= 3:
+            signal = "BUY"
+        elif net <= -3:
+            signal = "SELL"
+        else:
+            signal = "HOLD"
+
+    confidence = min(100, round(50 + abs(net) * 6))
     return signal, confidence, bullish, bearish
+
+
+def analyze_indicators(df):
+    """Compute all indicators for a DataFrame and run the consensus engine."""
+    if df.empty:
+        return None
+
+    closes = df["Close"].to_numpy()
+    price = float(closes[-1])
+    rsi = calculate_rsi(closes)
+    macd_info = calculate_macd(closes)
+    boll = calculate_bollinger(closes)
+    ema50 = calculate_ema(closes, 50)
+    ema200 = calculate_ema(closes, 200)
+    atr = calculate_atr(df)
+    adx = calculate_adx(df)
+    vol_ok = volume_confirmation(df)
+    pattern = detect_candlestick_pattern(df)
+
+    signal, confidence, bullish, bearish = compute_consensus(
+        price, rsi, macd_info, boll, adx, vol_ok, pattern
+    )
+
+    return {
+        "price": price,
+        "rsi": rsi,
+        "macd": macd_info,
+        "boll": boll,
+        "ema50": ema50[-1] if ema50 else None,
+        "ema200": ema200[-1] if ema200 else None,
+        "atr": atr,
+        "adx": adx,
+        "vol_ok": vol_ok,
+        "pattern": pattern,
+        "signal": signal,
+        "confidence": confidence,
+        "bullish": bullish,
+        "bearish": bearish,
+    }
+
+
+def generate_atr_tp_sl(price, atr, signal):
+    """Dynamic TP/SL based on ATR."""
+    if atr is None or atr <= 0:
+        return None
+
+    if signal in ("BUY", "STRONG BUY"):
+        return {
+            "SL": price - 1.5 * atr,
+            "TP1": price + 1.5 * atr,
+            "TP2": price + 3 * atr,
+        }
+    if signal in ("SELL", "STRONG SELL"):
+        return {
+            "SL": price + 1.5 * atr,
+            "TP1": price - 1.5 * atr,
+            "TP2": price - 3 * atr,
+        }
+    return None
+
+
+def timeframe_trend(df):
+    """Return EMA50 slope direction ('bullish'/'bearish'/'neutral')."""
+    if df.empty:
+        return "neutral"
+
+    ema50 = calculate_ema(df["Close"].to_numpy(), 50)
+    if len(ema50) < 3:
+        return "neutral"
+
+    slope = ema50[-1] - ema50[-3]
+    if slope > 0:
+        return "bullish"
+    if slope < 0:
+        return "bearish"
+    return "neutral"
+
+
+def confluence_badge(direction, tf_trends):
+    """Return 🟢/🔴/🟡 based on whether shorter/longer timeframes agree."""
+    if direction == "neutral":
+        return "🟡"
+
+    bullish_count = sum(1 for t in tf_trends if t == "bullish")
+    bearish_count = sum(1 for t in tf_trends if t == "bearish")
+
+    if direction == "bullish":
+        if bullish_count == len(tf_trends):
+            return "🟢"
+        if bearish_count == len(tf_trends):
+            return "🔴"
+    else:
+        if bearish_count == len(tf_trends):
+            return "🟢"
+        if bullish_count == len(tf_trends):
+            return "🔴"
+    return "🟡"
 
 
 def normalize_symbol(text):
@@ -610,20 +828,13 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
         df = fetch_klines(symbol, interval="15m", limit=300)
-        if df.empty:
+        result = analyze_indicators(df)
+        if result is None:
             continue
 
-        closes = df["Close"].to_numpy()
-        price = float(closes[-1])
-        rsi = calculate_rsi(closes)
-        macd_info = calculate_macd(closes)
-        boll = calculate_bollinger(closes)
-        ema200 = calculate_ema(closes, 200)
-        ema200_last = ema200[-1] if ema200 else None
-
-        signal, confidence, _, _ = compute_consensus(
-            price, rsi, macd_info, boll, ema200_last
-        )
+        price = result["price"]
+        signal = result["signal"]
+        confidence = result["confidence"]
 
         direction = trade["direction"]
         reversal = (
@@ -862,6 +1073,8 @@ async def run_news(symbol):
 
 
 def generate_chart(dataframe, symbol):
+    plt.close("all")
+
     market_colors = mpf.make_marketcolors(
         up="#00c076", down="#ff4d5e", edge="inherit", wick="inherit", volume="inherit"
     )
@@ -873,15 +1086,17 @@ def generate_chart(dataframe, symbol):
         gridstyle="--",
         y_on_right=True,
     )
-    buffer = io.BytesIO()
-    mpf.plot(
+    fig, _ = mpf.plot(
         dataframe,
         type="candle",
         volume=True,
         style=style,
         title=f"{symbol.replace('USDT', '/USDT')} · 1h",
-        savefig=dict(fname=buffer, dpi=110, bbox_inches="tight"),
+        returnfig=True,
     )
+    buffer = io.BytesIO()
+    fig.savefig(buffer, dpi=110, bbox_inches="tight")
+    plt.close(fig)
     buffer.seek(0)
     return buffer
 
@@ -1008,52 +1223,68 @@ def run_analysis(symbol):
     if df.empty:
         return None
 
-    closes = df["Close"].to_numpy()
-    price = float(df["Close"].iloc[-1])
+    result = analyze_indicators(df)
+    if result is None:
+        return None
 
-    rsi = calculate_rsi(closes)
-    macd_info = calculate_macd(closes)
-    boll = calculate_bollinger(closes)
-    ema50 = calculate_ema(closes, 50)
-    ema200 = calculate_ema(closes, 200)
+    df_15m = fetch_klines(symbol, interval="15m", limit=300)
+    df_4h = fetch_klines(symbol, interval="4h", limit=300)
+    tf_trends = [timeframe_trend(df_15m), timeframe_trend(df_4h)]
 
-    ema50_last = ema50[-1] if ema50 else None
-    ema200_last = ema200[-1] if ema200 else None
+    direction = "neutral"
+    if result["signal"] in ("BUY", "STRONG BUY"):
+        direction = "bullish"
+    elif result["signal"] in ("SELL", "STRONG SELL"):
+        direction = "bearish"
+    confluence = confluence_badge(direction, tf_trends)
 
-    signal, confidence, bullish, bearish = compute_consensus(
-        price, rsi, macd_info, boll, ema200_last
-    )
+    tp_sl = generate_atr_tp_sl(result["price"], result["atr"], result["signal"])
 
-    caption = build_analysis_caption(
-        symbol, price, rsi, macd_info, boll, ema50_last, ema200_last,
-        signal, confidence, bullish, bearish,
-    )
+    caption = build_analysis_caption(symbol, result, tp_sl, confluence)
     chart = generate_chart(df.tail(100), symbol)
 
     return caption, chart, {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "symbol": symbol,
-        "price": price,
-        "rsi": rsi,
-        "macd": macd_info["macd"],
-        "macd_signal": macd_info["signal"],
-        "macd_histogram": macd_info["histogram"],
-        "bb_upper": boll["upper"],
-        "bb_middle": boll["middle"],
-        "bb_lower": boll["lower"],
-        "ema50": ema50_last,
-        "ema200": ema200_last,
-        "bullish": bullish,
-        "bearish": bearish,
-        "signal": signal,
-        "confidence": confidence,
+        "price": result["price"],
+        "rsi": result["rsi"],
+        "macd": result["macd"]["macd"],
+        "macd_signal": result["macd"]["signal"],
+        "macd_histogram": result["macd"]["histogram"],
+        "bb_upper": result["boll"]["upper"],
+        "bb_middle": result["boll"]["middle"],
+        "bb_lower": result["boll"]["lower"],
+        "ema50": result["ema50"],
+        "ema200": result["ema200"],
+        "adx": result["adx"],
+        "atr": result["atr"],
+        "bullish": result["bullish"],
+        "bearish": result["bearish"],
+        "signal": result["signal"],
+        "confidence": result["confidence"],
     }
 
 
-def build_analysis_caption(symbol, price, rsi, macd_info, boll, ema50, ema200,
-                           signal, confidence, bullish, bearish):
+def build_analysis_caption(symbol, result, tp_sl, confluence):
     display = symbol.replace("USDT", "/USDT")
+    price = result["price"]
+    rsi = result["rsi"]
+    macd_info = result["macd"]
+    boll = result["boll"]
+    ema50 = result["ema50"]
+    ema200 = result["ema200"]
+    adx = result["adx"]
+    atr = result["atr"]
+    vol_ok = result["vol_ok"]
+    pattern = result["pattern"]
+    signal = result["signal"]
+    confidence = result["confidence"]
+    bullish = result["bullish"]
+    bearish = result["bearish"]
+
     rsi_txt = f"{rsi:.2f}" if rsi is not None else "N/A"
+    adx_txt = f"{adx:.2f}" if adx is not None else "N/A"
+    atr_txt = f"{atr:,.2f}" if atr is not None else "N/A"
     macd_txt = f"{macd_info['macd']:,.2f}" if macd_info["macd"] is not None else "N/A"
     sig_txt = f"{macd_info['signal']:,.2f}" if macd_info["signal"] is not None else "N/A"
     hist_txt = f"{macd_info['histogram']:,.2f}" if macd_info["histogram"] is not None else "N/A"
@@ -1063,27 +1294,38 @@ def build_analysis_caption(symbol, price, rsi, macd_info, boll, ema50, ema200,
     bb_lower_txt = f"{boll['lower']:,.2f}" if boll["lower"] is not None else "N/A"
     ema50_txt = f"{ema50:,.2f}" if ema50 is not None else "N/A"
     ema200_txt = f"{ema200:,.2f}" if ema200 is not None else "N/A"
+    vol_txt = "✅" if vol_ok else "❌"
+    pattern_txt = pattern.replace("_", " ").title() if pattern else "None"
 
-    return (
-        f"📊 <b>ANALYSIS — {display}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 <b>Price</b>: ${price:,.2f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>RSI(14)</b>: {rsi_txt}\n"
-        f"🔀 <b>MACD</b> (12,26,9)\n"
-        f"   Line: {macd_txt} · Signal: {sig_txt}\n"
-        f"   Histogram: {hist_txt} · Cross: <b>{cross_txt}</b>\n"
-        f"🎗 <b>Bollinger Bands</b> (20,2)\n"
-        f"   Upper: {bb_upper_txt}\n"
-        f"   Middle: {bb_mid_txt}\n"
-        f"   Lower: {bb_lower_txt}\n"
-        f"📉 <b>EMA(50)</b>: {ema50_txt}\n"
-        f"📉 <b>EMA(200)</b>: {ema200_txt}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🐂 Bullish: <b>{bullish}</b> · 🐻 Bearish: <b>{bearish}</b>\n"
-        f"🚦 <b>Signal</b>: {SIGNAL_EMOJI[signal]} <b>{signal}</b>\n"
-        f"🧠 <b>AI Confidence</b>: <b>{confidence}%</b>"
-    )
+    lines = [
+        f"📊 <b>QUANT v4 ANALYSIS — {display}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💵 <b>Price</b>: ${price:,.2f}",
+        f"🔀 <b>Confluence</b>: {confluence}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📈 <b>RSI(14)</b>: {rsi_txt}  ·  <b>ADX(14)</b>: {adx_txt}",
+        f"🎚 <b>ATR(14)</b>: {atr_txt}",
+        f"🔀 <b>MACD</b> (12,26,9)",
+        f"   Line: {macd_txt} · Signal: {sig_txt}",
+        f"   Histogram: {hist_txt} · Cross: <b>{cross_txt}</b>",
+        f"🎗 <b>Bollinger Bands</b> (20,2)",
+        f"   Upper: {bb_upper_txt} · Middle: {bb_mid_txt} · Lower: {bb_lower_txt}",
+        f"📉 <b>EMA(50)</b>: {ema50_txt} · <b>EMA(200)</b>: {ema200_txt}",
+        f"📊 <b>Volume Confirm</b>: {vol_txt} · <b>Pattern</b>: {pattern_txt}",
+    ]
+
+    if tp_sl:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🎯 <b>Dynamic TP/SL (ATR)</b>")
+        lines.append(f"   🟢 TP1: ${tp_sl['TP1']:,.2f} · 🟢 TP2: ${tp_sl['TP2']:,.2f}")
+        lines.append(f"   🔴 SL: ${tp_sl['SL']:,.2f}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🐂 Bullish: <b>{bullish}</b> · 🐻 Bearish: <b>{bearish}</b>")
+    lines.append(f"🚦 <b>Signal</b>: {SIGNAL_EMOJI[signal]} <b>{signal}</b>")
+    lines.append(f"🧠 <b>AI Confidence</b>: <b>{confidence}%</b>")
+
+    return "\n".join(lines)
 
 
 def welcome_text():
@@ -1204,23 +1446,14 @@ def confirm_keyboard():
 
 def scan_symbol(symbol):
     df = fetch_klines(symbol, interval="1h", limit=300)
-    if df.empty:
+    result = analyze_indicators(df)
+    if result is None:
         return None
-
-    closes = df["Close"].to_numpy()
-    price = float(closes[-1])
-    rsi = calculate_rsi(closes)
-    macd_info = calculate_macd(closes)
-    boll = calculate_bollinger(closes)
-    ema200 = calculate_ema(closes, 200)
-    ema200_last = ema200[-1] if ema200 else None
-
-    signal, confidence, _, _ = compute_consensus(price, rsi, macd_info, boll, ema200_last)
     return {
         "symbol": symbol,
-        "price": price,
-        "signal": signal,
-        "confidence": confidence,
+        "price": result["price"],
+        "signal": result["signal"],
+        "confidence": result["confidence"],
     }
 
 
