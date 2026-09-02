@@ -1098,6 +1098,7 @@ def generate_chart(dataframe, symbol):
     fig.savefig(buffer, dpi=110, bbox_inches="tight")
     plt.close(fig)
     buffer.seek(0)
+    buffer.name = f"{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.png"
     return buffer
 
 
@@ -1670,7 +1671,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption, chart, log_entry = result
     save_log(log_entry)
-    await update.message.reply_photo(photo=chart, caption=caption, parse_mode="HTML")
+    await update.message.reply_photo(photo=chart, filename=chart.name, caption=caption, parse_mode="HTML")
 
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2275,7 +2276,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             caption, chart, log_entry = result
             save_log(log_entry)
-            await query.message.reply_photo(photo=chart, caption=caption, parse_mode="HTML")
+            await query.message.reply_photo(photo=chart, filename=chart.name, caption=caption, parse_mode="HTML")
 
         elif data.startswith("trade:"):
             symbol = data.split(":", 1)[1]
