@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import sys
 import threading
@@ -7,17 +6,12 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import mplfinance as mpf
 import pandas as pd
 import requests
 from flask import Flask
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
@@ -92,6 +86,21 @@ SUPPORTED_SYMBOLS = [
 ]
 SYMBOL_DISPLAY = {s: s.replace("USDT", "/USDT") for s in SUPPORTED_SYMBOLS}
 SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
+
+TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+COINLORE_SLUGS = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "BNBUSDT": "binance-coin",
+    "ADAUSDT": "cardano",
+    "XRPUSDT": "ripple",
+    "DOGEUSDT": "dogecoin",
+    "DOTUSDT": "polkadot",
+    "LINKUSDT": "chainlink",
+    "LTCUSDT": "litecoin",
+}
 
 SYMBOL_KEYWORDS = {
     "BTCUSDT": ["btc", "bitcoin"],
@@ -1090,34 +1099,51 @@ async def run_news(symbol):
     return build_news_message(base, articles, sentiment, matched)
 
 
-def generate_chart(dataframe, symbol):
-    plt.close("all")
+def get_chart_url(symbol, timeframe="1h", df=None):
+    """Return a direct chart image URL (QuickChart) for the given symbol/timeframe."""
+    if df is None or df.empty:
+        df = fetch_klines(symbol, interval=timeframe, limit=60)
 
-    market_colors = mpf.make_marketcolors(
-        up="#00c076", down="#ff4d5e", edge="inherit", wick="inherit", volume="inherit"
-    )
-    style = mpf.make_mpf_style(
-        marketcolors=market_colors,
-        facecolor="#12121c",
-        figcolor="#12121c",
-        gridcolor="#2a2a3a",
-        gridstyle="--",
-        y_on_right=True,
-    )
-    fig, _ = mpf.plot(
-        dataframe,
-        type="candle",
-        volume=True,
-        style=style,
-        title=f"{symbol.replace('USDT', '/USDT')} · 1h",
-        returnfig=True,
-    )
-    buffer = io.BytesIO()
-    fig.savefig(buffer, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    buffer.seek(0)
-    buffer.name = f"{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.png"
-    return buffer
+    if df.empty:
+        slug = COINLORE_SLUGS.get(symbol, symbol.replace("USDT", "").lower())
+        return f"https://charts.coinlore.com/static/img/{slug}_1h.png"
+
+    closes = [round(float(x), 2) for x in df["Close"].to_numpy()[-60:]]
+    labels = [ts.strftime("%m/%d %H:%M") for ts in df.index[-60:]]
+
+    config = {
+        "type": "line",
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": f"{symbol.replace('USDT', '/USDT')} · {timeframe}",
+                "data": closes,
+                "borderColor": "#00c076",
+                "backgroundColor": "rgba(0,192,118,0.15)",
+                "fill": True,
+                "pointRadius": 0,
+                "borderWidth": 2,
+                "tension": 0.1,
+            }],
+        },
+        "options": {
+            "scales": {
+                "x": {"ticks": {"display": False}, "grid": {"display": False}},
+                "y": {"grid": {"color": "#2a2a3a"}, "ticks": {"color": "#9aa0a6"}},
+            },
+            "plugins": {"legend": {"labels": {"color": "#ffffff"}}},
+        },
+    }
+
+    config_json = json.dumps(config, separators=(",", ":"))
+    return f"https://quickchart.io/chart?width=600&height=400&bkg=12121c&c={quote(config_json)}"
+
+
+def timeframe_keyboard(symbol):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tf, callback_data=f"tf:{symbol}:{tf}") for tf in TIMEFRAMES],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="menu")],
+    ])
 
 
 def load_log():
@@ -1237,8 +1263,8 @@ def close_trade(trade_id, current_price):
     return trade
 
 
-def run_analysis(symbol):
-    df = fetch_klines(symbol, interval="1h", limit=300)
+def run_analysis(symbol, timeframe="1h"):
+    df = fetch_klines(symbol, interval=timeframe, limit=300)
     if df.empty:
         return None
 
@@ -1259,12 +1285,13 @@ def run_analysis(symbol):
 
     tp_sl = generate_atr_tp_sl(result["price"], result["atr"], result["signal"])
 
-    caption = build_analysis_caption(symbol, result, tp_sl, confluence)
-    chart = generate_chart(df.tail(100), symbol)
+    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe)
+    chart_url = get_chart_url(symbol, timeframe, df.tail(60))
 
-    return caption, chart, {
+    return caption, chart_url, {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "symbol": symbol,
+        "timeframe": timeframe,
         "price": result["price"],
         "rsi": result["rsi"],
         "macd": result["macd"]["macd"],
@@ -1284,7 +1311,7 @@ def run_analysis(symbol):
     }
 
 
-def build_analysis_caption(symbol, result, tp_sl, confluence):
+def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h"):
     display = symbol.replace("USDT", "/USDT")
     price = result["price"]
     rsi = result["rsi"]
@@ -1317,7 +1344,7 @@ def build_analysis_caption(symbol, result, tp_sl, confluence):
     pattern_txt = pattern.replace("_", " ").title() if pattern else "None"
 
     lines = [
-        f"📊 <b>QUANT v4 ANALYSIS — {display}</b>",
+        f"📊 <b>QUANT v4 ANALYSIS — {display} ({timeframe})</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"💵 <b>Price</b>: ${price:,.2f}",
         f"🔀 <b>Confluence</b>: {confluence}",
@@ -1665,6 +1692,9 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = normalize_symbol(context.args[0]) if context.args else "BTCUSDT"
+    timeframe = context.args[1] if len(context.args) > 1 else "1h"
+    if timeframe not in TIMEFRAMES:
+        timeframe = "1h"
 
     if symbol is None:
         await update.message.reply_text(
@@ -1674,7 +1704,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        result = run_analysis(symbol)
+        result = run_analysis(symbol, timeframe)
     except Exception as exc:
         print(f"❌ ERROR in /analyze: {exc}")
         result = None
@@ -1687,9 +1717,12 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    caption, chart, log_entry = result
+    caption, chart_url, log_entry = result
     save_log(log_entry)
-    await update.message.reply_photo(photo=chart, caption=caption, parse_mode="HTML")
+    await update.message.reply_photo(
+        photo=chart_url, caption=caption, parse_mode="HTML",
+        reply_markup=timeframe_keyboard(symbol),
+    )
 
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2285,16 +2318,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("analyze:"):
             symbol = data.split(":", 1)[1]
-            result = run_analysis(symbol)
+            result = run_analysis(symbol, "1h")
             if result is None:
                 await query.edit_message_text(
                     f"⚠️ <b>Analysis failed</b> for <b>{symbol.replace('USDT', '/USDT')}</b>.",
                     parse_mode="HTML",
                 )
                 return
-            caption, chart, log_entry = result
+            caption, chart_url, log_entry = result
             save_log(log_entry)
-            await query.message.reply_photo(photo=chart, caption=caption, parse_mode="HTML")
+            await query.message.reply_photo(
+                photo=chart_url, caption=caption, parse_mode="HTML",
+                reply_markup=timeframe_keyboard(symbol),
+            )
+
+        elif data.startswith("tf:"):
+            _, symbol, timeframe = data.split(":")
+            if timeframe not in TIMEFRAMES:
+                timeframe = "1h"
+            result = run_analysis(symbol, timeframe)
+            if result is None:
+                await query.answer("Analysis failed. Try again.")
+                return
+            caption, chart_url, log_entry = result
+            save_log(log_entry)
+            await query.edit_message_media(
+                media=InputMediaPhoto(media=chart_url, caption=caption, parse_mode="HTML"),
+                reply_markup=timeframe_keyboard(symbol),
+            )
 
         elif data.startswith("trade:"):
             symbol = data.split(":", 1)[1]
