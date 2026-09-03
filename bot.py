@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import threading
 import uuid
@@ -40,7 +41,8 @@ def keepalive_health():
 
 
 def run_flask():
-    keepalive_app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    keepalive_app.run(host="0.0.0.0", port=port)
 
 
 @keepalive_app.route("/api/prices")
