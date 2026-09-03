@@ -89,19 +89,6 @@ SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
-COINLORE_SLUGS = {
-    "BTCUSDT": "bitcoin",
-    "ETHUSDT": "ethereum",
-    "SOLUSDT": "solana",
-    "BNBUSDT": "binance-coin",
-    "ADAUSDT": "cardano",
-    "XRPUSDT": "ripple",
-    "DOGEUSDT": "dogecoin",
-    "DOTUSDT": "polkadot",
-    "LINKUSDT": "chainlink",
-    "LTCUSDT": "litecoin",
-}
-
 SYMBOL_KEYWORDS = {
     "BTCUSDT": ["btc", "bitcoin"],
     "ETHUSDT": ["eth", "ethereum"],
@@ -1099,44 +1086,24 @@ async def run_news(symbol):
     return build_news_message(base, articles, sentiment, matched)
 
 
-def get_chart_url(symbol, timeframe="1h", df=None):
-    """Return a direct chart image URL (QuickChart) for the given symbol/timeframe."""
-    if df is None or df.empty:
-        df = fetch_klines(symbol, interval=timeframe, limit=60)
-
-    if df.empty:
-        slug = COINLORE_SLUGS.get(symbol, symbol.replace("USDT", "").lower())
-        return f"https://charts.coinlore.com/static/img/{slug}_1h.png"
-
-    closes = [round(float(x), 2) for x in df["Close"].to_numpy()[-60:]]
-    labels = [ts.strftime("%m/%d %H:%M") for ts in df.index[-60:]]
-
-    config = {
-        "type": "line",
-        "data": {
-            "labels": labels,
-            "datasets": [{
-                "label": f"{symbol.replace('USDT', '/USDT')} · {timeframe}",
-                "data": closes,
-                "borderColor": "#00c076",
-                "backgroundColor": "rgba(0,192,118,0.15)",
-                "fill": True,
-                "pointRadius": 0,
-                "borderWidth": 2,
-                "tension": 0.1,
-            }],
-        },
-        "options": {
-            "scales": {
-                "x": {"ticks": {"display": False}, "grid": {"display": False}},
-                "y": {"grid": {"color": "#2a2a3a"}, "ticks": {"color": "#9aa0a6"}},
-            },
-            "plugins": {"legend": {"labels": {"color": "#ffffff"}}},
-        },
+def get_tradingview_chart_url(symbol, timeframe="1h"):
+    """Return a Microlink screenshot URL of a live TradingView chart."""
+    interval_map = {
+        "15m": "15",
+        "1h": "60",
+        "4h": "240",
+        "1d": "D",
     }
+    interval = interval_map.get(timeframe, "60")
 
-    config_json = json.dumps(config, separators=(",", ":"))
-    return f"https://quickchart.io/chart?width=600&height=400&bkg=12121c&c={quote(config_json)}"
+    tv_symbol = f"BINANCE:{symbol}"
+    tv_url = (
+        f"https://s.tradingview.com/widgetembed/"
+        f"?symbol={tv_symbol}&interval={interval}&theme=dark&style=1"
+    )
+
+    encoded_tv = quote(tv_url)
+    return f"https://api.microlink.io?url={encoded_tv}&screenshot=true&embed=screenshot.url"
 
 
 def timeframe_keyboard(symbol):
@@ -1286,7 +1253,7 @@ def run_analysis(symbol, timeframe="1h"):
     tp_sl = generate_atr_tp_sl(result["price"], result["atr"], result["signal"])
 
     caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe)
-    chart_url = get_chart_url(symbol, timeframe, df.tail(60))
+    chart_url = get_tradingview_chart_url(symbol, timeframe)
 
     return caption, chart_url, {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
