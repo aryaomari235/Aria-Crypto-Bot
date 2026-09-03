@@ -10,7 +10,8 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
-from flask import Flask
+from flask import Flask, jsonify
+from flask_cors import CORS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from telegram.ext import (
@@ -25,6 +26,7 @@ from telegram.ext import (
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 keepalive_app = Flask(__name__)
+CORS(keepalive_app)
 
 
 @keepalive_app.route("/")
@@ -34,11 +36,80 @@ def keepalive_home():
 
 @keepalive_app.route("/health")
 def keepalive_health():
-    return "OK", 200
+    return jsonify({"status": "ok"})
 
 
 def run_flask():
     keepalive_app.run(host="0.0.0.0", port=10000)
+
+
+@keepalive_app.route("/api/prices")
+def api_prices():
+    prices = []
+    for symbol in SUPPORTED_SYMBOLS:
+        price = get_price(symbol)
+        prices.append({
+            "symbol": symbol,
+            "display": symbol.replace("USDT", "/USDT"),
+            "price": price,
+        })
+    return jsonify({"prices": prices, "last_updated": _now_iso()})
+
+
+@keepalive_app.route("/api/signals")
+def api_signals():
+    signals = []
+    for symbol in SUPPORTED_SYMBOLS:
+        r = scan_symbol(symbol)
+        if r is not None:
+            signals.append(r)
+    return jsonify({"signals": signals, "last_updated": _now_iso()})
+
+
+@keepalive_app.route("/api/market")
+def api_market():
+    value, classification = fetch_fear_greed()
+    return jsonify({
+        "fear_greed": {"value": value, "classification": classification},
+        "last_updated": _now_iso(),
+    })
+
+
+@keepalive_app.route("/api/whales")
+def api_whales():
+    return jsonify({"whales": get_recent_whales(24), "last_updated": _now_iso()})
+
+
+@keepalive_app.route("/api/portfolio")
+def api_portfolio():
+    return jsonify({"portfolio": load_trades().get("active", []), "last_updated": _now_iso()})
+
+
+@keepalive_app.route("/api/news")
+def api_news():
+    articles = _fetch_rss_news_sync(10)
+    return jsonify({"news": articles, "last_updated": _now_iso()})
+
+
+@keepalive_app.route("/api/analyze/<symbol>")
+def api_analyze(symbol):
+    normalized = normalize_symbol(symbol)
+    if normalized is None:
+        return jsonify({"error": "invalid symbol"}), 400
+    result = run_analysis(normalized, "1h")
+    if result is None:
+        return jsonify({"error": "analysis failed"}), 500
+    caption, chart_url, log_entry = result
+    return jsonify({"chart_url": chart_url, "data": log_entry})
+
+
+@keepalive_app.route("/api/data", methods=["GET"])
+def api_data():
+    return jsonify(webapp_cache)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 BASE_URL = "https://data-api.binance.vision/api/v3/klines"
 LOG_FILE = "signals_log.json"
@@ -88,6 +159,8 @@ SYMBOL_DISPLAY = {s: s.replace("USDT", "/USDT") for s in SUPPORTED_SYMBOLS}
 SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+webapp_cache = {}
 
 SYMBOL_KEYWORDS = {
     "BTCUSDT": ["btc", "bitcoin"],
@@ -927,6 +1000,19 @@ async def _fetch_rss_news(limit=3):
         except Exception as exc:
             print(f"❌ ERROR: RSS feed {source_name} failed — {exc}")
 
+    return articles[:limit]
+
+
+def _fetch_rss_news_sync(limit=10):
+    headers = {"User-Agent": "Mozilla/5.0 (crypto-bot)"}
+    articles = []
+    for source_name, url in RSS_FEEDS:
+        try:
+            response = requests.get(url, headers=headers, timeout=TIMEOUT)
+            response.raise_for_status()
+            articles.extend(_parse_rss_feed(response.text, source_name))
+        except Exception as exc:
+            print(f"❌ ERROR: RSS feed {source_name} failed — {exc}")
     return articles[:limit]
 
 
@@ -2492,6 +2578,67 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ ERROR in button_handler: {exc}")
 
 
+def fetch_24h_ticker_data(symbol):
+    """Fetch latest price and 24h % change for a symbol."""
+    try:
+        response = requests.get(
+            "https://data-api.binance.vision/api/v3/ticker/24hr",
+            params={"symbol": symbol},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "symbol": symbol,
+            "display": symbol.replace("USDT", "/USDT"),
+            "price": float(data["lastPrice"]),
+            "change_24h": float(data["priceChangePercent"]),
+        }
+    except Exception as exc:
+        print(f"❌ ERROR: 24h ticker failed for {symbol} — {exc}")
+        return None
+
+
+async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
+    global webapp_cache
+
+    def build():
+        data = {
+            "prices": [],
+            "signals": [],
+            "fear_greed": {},
+            "whales": [],
+            "news": [],
+            "portfolio": [],
+            "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+
+        for symbol in SUPPORTED_SYMBOLS[:5]:
+            ticker = fetch_24h_ticker_data(symbol)
+            if ticker:
+                data["prices"].append(ticker)
+
+            result = scan_symbol(symbol)
+            if result:
+                data["signals"].append(result)
+
+        value, classification = fetch_fear_greed()
+        data["fear_greed"] = {"value": value, "classification": classification}
+
+        data["whales"] = get_recent_whales(24)
+
+        data["news"] = _fetch_rss_news_sync(5)
+
+        data["portfolio"] = load_trades().get("active", [])
+
+        return data
+
+    try:
+        webapp_cache = await asyncio.to_thread(build)
+    except Exception as exc:
+        print(f"❌ ERROR updating webapp cache: {exc}")
+
+
 def main():
     application = (
         ApplicationBuilder()
@@ -2537,6 +2684,7 @@ def main():
     application.job_queue.run_repeating(whale_tracker_loop, interval=120, first=10)
     application.job_queue.run_repeating(check_price_alerts, interval=30, first=5)
     application.job_queue.run_repeating(position_monitor_loop, interval=60, first=15)
+    application.job_queue.run_repeating(update_webapp_cache_loop, interval=60, first=5)
 
     threading.Thread(target=run_flask, daemon=True).start()
     print("🌐 Flask server started on port 10000")
