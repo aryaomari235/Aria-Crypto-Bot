@@ -1,8 +1,5 @@
 requests
 pandas
-matplotlib
-mplfinance
 python-telegram-bot[job-queue]
-google-generativeai
-textblob
 flask
+flask-cors
