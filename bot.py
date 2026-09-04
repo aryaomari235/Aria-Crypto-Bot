@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
@@ -116,6 +116,53 @@ def api_analyze(symbol):
 @keepalive_app.route("/api/data", methods=["GET"])
 def api_data():
     return jsonify(webapp_cache)
+
+
+@keepalive_app.route('/trade', methods=['POST', 'OPTIONS'])
+def trade_open():
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(force=True, silent=True) or {}
+    symbol = data.get('symbol')
+    direction = data.get('direction')
+    leverage = data.get('leverage')
+    margin = data.get('margin')
+    if not symbol or not direction:
+        return jsonify({"status": "error", "message": "Missing symbol or direction"}), 400
+    try:
+        leverage = int(leverage) if leverage is not None else 1
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid leverage"}), 400
+    try:
+        margin = float(margin) if margin is not None else DEFAULT_NOTIONAL
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid margin"}), 400
+    price = get_price(symbol)
+    if price is None:
+        return jsonify({"status": "error", "message": "Failed to fetch price"}), 500
+    open_trade(symbol, direction, leverage, price, margin)
+    webapp_cache['portfolio'] = load_trades().get("active", [])
+    return jsonify({"status": "success", "message": "Trade opened"})
+
+
+@keepalive_app.route('/close', methods=['POST', 'OPTIONS'])
+def trade_close():
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(force=True, silent=True) or {}
+    trade_id = data.get('id')
+    if not trade_id:
+        return jsonify({"status": "error", "message": "Missing trade id"}), 400
+    trades = load_trades().get("active", [])
+    trade = next((t for t in trades if t.get('id') == trade_id), None)
+    if trade is None:
+        return jsonify({"status": "error", "message": "Trade not found"}), 404
+    price = get_price(trade.get('symbol'))
+    if price is None:
+        return jsonify({"status": "error", "message": "Failed to fetch price"}), 500
+    close_trade(trade_id, price)
+    webapp_cache['portfolio'] = load_trades().get("active", [])
+    return jsonify({"status": "success", "message": "Trade closed"})
 
 
 def _now_iso():
