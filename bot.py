@@ -113,6 +113,14 @@ def api_analyze(symbol):
     return jsonify({"chart_url": chart_url, "data": log_entry})
 
 
+@keepalive_app.route("/api/performance")
+def api_performance():
+    try:
+        return jsonify({"performance": calculate_performance(), "last_updated": _now_iso()})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @keepalive_app.route("/api/data", methods=["GET"])
 def api_data():
     return jsonify(webapp_cache)
@@ -209,11 +217,33 @@ TELEGRAM_TOKEN = "8877914394:AAHSPfZx3x2E2qQl929LedIj9NTfUnwgaMw"
 CHAT_ID = "758980281"
 
 SUPPORTED_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT",
-    "XRPUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
+    "ADAUSDT", "XRPUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT",
+    "NEARUSDT", "AVAXUSDT", "MATICUSDT", "SUIUSDT", "APTUSDT",
+    "FETUSDT", "SHIBUSDT", "PEPEUSDT", "RENDERUSDT", "INJUSDT",
+    "OPUSDT", "ARBUSDT", "TIAUSDT", "SEIUSDT", "ATOMUSDT",
+    "FILUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "GALAUSDT",
+    "ETCUSDT", "TRXUSDT", "TONUSDT", "UNIUSDT", "AAVEUSDT",
+    "MKRUSDT", "SNXUSDT", "STXUSDT", "IMXUSDT", "LDOUSDT",
+    "HBARUSDT", "VETUSDT", "ALGOUSDT", "FTMUSDT", "ARUSDT",
+    "JUPUSDT", "WLDUSDT", "PYTHUSDT", "ONDOUSDT", "JASMYUSDT",
+    "ENAUSDT", "TAOUSDT",
 ]
 SYMBOL_DISPLAY = {s: s.replace("USDT", "/USDT") for s in SUPPORTED_SYMBOLS}
 SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
+
+# --- Quant Auto-Trader v6.0 Engine Config ---
+MAX_ACTIVE_TRADES = 5
+AUTO_TRADE_MIN_CONFIDENCE = 80
+AUTO_TRADE_LEVERAGE = 5
+AUTO_TRADE_NOTIONAL = 1000.0
+AUTO_TRADE_TIMEFRAMES = ["15m", "1h", "4h"]
+TRAILING_BE_TRIGGER_PCT = 3.0    # lock SL at break-even
+TRAILING_TRAIL_TRIGGER_PCT = 7.0  # trail SL to current - 1.5*ATR
+TRAILING_ATR_MULT = 1.5
+TIME_DECAY_MAX_HOURS = 4.0
+TIME_DECAY_MIN_PNL_PCT = -2.0
+TIME_DECAY_MAX_PNL_PCT = 1.5
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
@@ -230,7 +260,27 @@ SYMBOL_KEYWORDS = {
     "DOTUSDT": ["dot", "polkadot"],
     "LINKUSDT": ["link", "chainlink"],
     "LTCUSDT": ["ltc", "litecoin"],
+    "NEARUSDT": ["near", "near protocol"],
+    "AVAXUSDT": ["avax", "avalanche"],
+    "MATICUSDT": ["matic", "polygon"],
+    "SUIUSDT": ["sui"],
+    "APTUSDT": ["apt", "aptos"],
+    "FETUSDT": ["fet", "fetch.ai", "fetch"],
+    "SHIBUSDT": ["shib", "shiba"],
+    "PEPEUSDT": ["pepe"],
+    "RENDERUSDT": ["render", "rndr"],
+    "INJUSDT": ["inj", "injective"],
+    "OPUSDT": ["op", "optimism"],
+    "ARBUSDT": ["arb", "arbitrum"],
+    "TIAUSDT": ["tia", "celestia"],
+    "SEIUSDT": ["sei"],
+    "ATOMUSDT": ["atom", "cosmos"],
 }
+# Auto-fill keywords for remaining symbols so news filtering works for all 50+.
+for _sym in SUPPORTED_SYMBOLS:
+    if _sym not in SYMBOL_KEYWORDS:
+        _base = _sym.replace("USDT", "").lower()
+        SYMBOL_KEYWORDS[_sym] = [_base]
 
 SIGNAL_EMOJI = {
     "STRONG BUY": "🟢",
@@ -942,7 +992,197 @@ def format_liquidation_alert(trade, live_price):
     )
 
 
+def calc_trade_age_hours(trade):
+    """Return age of an open trade in hours (0.0 if unparseable)."""
+    fmt_variants = ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M:%S")
+    entry_time = trade.get("entry_time", "")
+    for fmt in fmt_variants:
+        try:
+            entry = datetime.strptime(entry_time, fmt)
+            if entry.tzinfo is None:
+                entry = entry.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - entry
+            return max(0.0, delta.total_seconds() / 3600.0)
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
+def check_mtf_confluence(symbol):
+    """Multi-timeframe confluence check for the auto-trader.
+
+    Returns (ok, info) where info holds 1h signal/confidence/price plus
+    15m & 4h trend directions. Requires STRONG BUY/SELL on 1h with
+    confidence >= AUTO_TRADE_MIN_CONFIDENCE and 15m+4h trends agreeing.
+    """
+    try:
+        df_1h = fetch_klines(symbol, interval="1h", limit=300)
+        result_1h = analyze_indicators(df_1h)
+        if result_1h is None:
+            return False, None
+        signal = result_1h.get("signal")
+        confidence = result_1h.get("confidence", 0)
+        if signal not in ("STRONG BUY", "STRONG SELL"):
+            return False, None
+        if confidence < AUTO_TRADE_MIN_CONFIDENCE:
+            return False, None
+
+        df_15m = fetch_klines(symbol, interval="15m", limit=300)
+        df_4h = fetch_klines(symbol, interval="4h", limit=300)
+        trend_15m = timeframe_trend(df_15m)
+        trend_4h = timeframe_trend(df_4h)
+
+        direction = "bullish" if signal == "STRONG BUY" else "bearish"
+        badge = confluence_badge(direction, [trend_15m, trend_4h])
+        if badge != "🟢":
+            return False, None
+
+        return True, {
+            "signal": signal,
+            "confidence": confidence,
+            "price": result_1h.get("price"),
+            "atr": result_1h.get("atr"),
+            "trend_15m": trend_15m,
+            "trend_4h": trend_4h,
+        }
+    except Exception as exc:
+        print(f"❌ ERROR: MTF confluence check failed for {symbol} — {exc}")
+        return False, None
+
+
+def calculate_performance():
+    """Calculate transparent live performance metrics from paper_trades.json."""
+    data = load_trades()
+    active = data.get("active", [])
+    history = data.get("history", [])
+
+    wins = sum(1 for t in history if float(t.get("pnl_usd", 0) or 0) > 0)
+    losses = len(history) - wins
+    win_rate_pct = round(wins / len(history) * 100, 2) if history else 0.0
+    realized_pnl_usd = round(sum(float(t.get("pnl_usd", 0) or 0) for t in history), 2)
+
+    unrealized_pnl_usd = 0.0
+    for t in active:
+        try:
+            live = get_price(t.get("symbol"))
+            if live is None:
+                continue
+            _, pnl_usd = calc_pnl(t, live)
+            unrealized_pnl_usd += pnl_usd
+        except Exception:
+            continue
+    unrealized_pnl_usd = round(unrealized_pnl_usd, 2)
+    total_pnl_usd = round(realized_pnl_usd + unrealized_pnl_usd, 2)
+
+    return {
+        "total_trades": len(history) + len(active),
+        "closed_trades": len(history),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": win_rate_pct,
+        "total_pnl_usd": total_pnl_usd,
+        "realized_pnl_usd": realized_pnl_usd,
+        "unrealized_pnl_usd": unrealized_pnl_usd,
+        "open_positions_count": len(active),
+        "last_updated": _now_iso(),
+    }
+
+
+def build_performance_message():
+    perf = calculate_performance()
+    emoji = "🟢" if perf["total_pnl_usd"] >= 0 else "🔴"
+    return (
+        "📊 <b>AUTO-TRADER PERFORMANCE (LIVE)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Total Trades: <b>{perf['total_trades']}</b> "
+        f"(Closed: {perf['closed_trades']} · Open: {perf['open_positions_count']})\n"
+        f"✅ Wins: <b>{perf['wins']}</b> · ❌ Losses: <b>{perf['losses']}</b>\n"
+        f"🎯 Win Rate: <b>{perf['win_rate_pct']:.2f}%</b>\n"
+        f"{emoji} Total P&amp;L: <b>${perf['total_pnl_usd']:+,.2f}</b>\n"
+        f"💰 Realized: <b>${perf['realized_pnl_usd']:+,.2f}</b> · "
+        f"⏳ Unrealized: <b>${perf['unrealized_pnl_usd']:+,.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Last updated: {perf['last_updated']}</i>"
+    )
+
+
+async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
+    """Quant Auto-Trader v6.0 execution engine — scans 50+ coins every 5 min."""
+    try:
+        data = load_trades()
+        active = data.get("active", [])
+        if len(active) >= MAX_ACTIVE_TRADES:
+            print(f"🤖 AUTO-TRADER: max active trades ({MAX_ACTIVE_TRADES}) reached — skipping scan.")
+            return
+
+        open_symbols = {t.get("symbol") for t in active}
+
+        for symbol in SUPPORTED_SYMBOLS:
+            # Re-check capacity inside the loop (a fill earlier in this scan counts).
+            data = load_trades()
+            active = data.get("active", [])
+            if len(active) >= MAX_ACTIVE_TRADES:
+                break
+            if symbol in {t.get("symbol") for t in active}:
+                continue
+
+            ok, info = await asyncio.to_thread(check_mtf_confluence, symbol)
+            if not ok or not info:
+                continue
+
+            signal = info["signal"]
+            confidence = info["confidence"]
+            direction = "LONG" if signal == "STRONG BUY" else "SHORT"
+            price = info.get("price") or await asyncio.to_thread(get_price, symbol)
+            if price is None:
+                continue
+
+            trade = await asyncio.to_thread(
+                open_trade, symbol, direction,
+                AUTO_TRADE_LEVERAGE, price, AUTO_TRADE_NOTIONAL,
+            )
+            # Tag auto-trades for transparency (rotation/trailing logic + UI).
+            try:
+                _d = load_trades()
+                for _t in _d.get("active", []):
+                    if _t.get("id") == trade.get("id"):
+                        _t["auto"] = True
+                        _t["signal"] = signal
+                        _t["confidence"] = confidence
+                        break
+                save_trades(_d)
+            except Exception as exc:
+                print(f"❌ ERROR tagging auto-trade {trade.get('id')}: {exc}")
+
+            print(f"🤖 AUTO-TRADE EXECUTED: {direction} {symbol} at ${price:,.2f} "
+                  f"({signal} {confidence}%)")
+
+            if is_chat_id_configured():
+                display = symbol.replace("USDT", "/USDT")
+                message = (
+                    f"🤖 <b>AUTO-TRADE OPENED</b>\n\n"
+                    f"Symbol: {display}\n"
+                    f"Direction: {direction} x{AUTO_TRADE_LEVERAGE}\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"Signal: {signal} ({confidence}%)\n"
+                    f"ID: #{trade.get('id')}"
+                )
+                try:
+                    await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML")
+                except Exception as exc:
+                    print(f"❌ ERROR sending auto-trade alert for {symbol}: {exc}")
+
+            webapp_cache["portfolio"] = load_trades().get("active", [])
+            try:
+                webapp_cache["performance"] = calculate_performance()
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"❌ ERROR in auto_trader_loop: {exc}")
+
+
 async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
+    """Smart position monitor — trailing stops, time-decay rotation, liquidation."""
     data = load_trades()
     active = data.get("active", [])
     if not active:
@@ -953,12 +1193,15 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
     for trade in list(active):
         symbol = trade["symbol"]
 
-        live_price = get_price(symbol)
+        live_price = await asyncio.to_thread(get_price, symbol)
         if live_price is not None:
             pnl_pct, _ = calc_pnl(trade, live_price)
+
+            # 1) Liquidation check: force close if P&L <= -100%.
             if pnl_pct <= -100.0:
                 trade_id = trade["id"]
                 finalize_trade(trade, live_price)
+                trade["close_reason"] = "liquidation"
                 data["active"].remove(trade)
                 data["history"].append(trade)
                 changed = True
@@ -971,7 +1214,100 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
                     print(f"❌ ERROR sending liquidation alert for {trade_id}: {exc}")
                 continue
 
-        df = fetch_klines(symbol, interval="15m", limit=300)
+            # 2) Smart trailing stop (unleveraged move % so 3%/7% map to price action).
+            try:
+                entry = float(trade.get("entry_price") or 0)
+                raw_move_pct = 0.0
+                if entry > 0:
+                    if trade.get("direction") == "LONG":
+                        raw_move_pct = (live_price - entry) / entry * 100
+                    else:
+                        raw_move_pct = (entry - live_price) / entry * 100
+
+                if raw_move_pct >= TRAILING_TRAIL_TRIGGER_PCT:
+                    df_atr = await asyncio.to_thread(fetch_klines, symbol, "1h", 100)
+                    atr = calculate_atr(df_atr) if not df_atr.empty else None
+                    if atr and atr > 0:
+                        if trade.get("direction") == "LONG":
+                            new_sl = live_price - TRAILING_ATR_MULT * atr
+                            old_sl = trade.get("trailing_sl")
+                            if old_sl is None or new_sl > old_sl:
+                                trade["trailing_sl"] = new_sl
+                                changed = True
+                                print(f"📈 TRAIL: #{trade['id']} {symbol} SL → ${new_sl:,.2f}")
+                        else:
+                            new_sl = live_price + TRAILING_ATR_MULT * atr
+                            old_sl = trade.get("trailing_sl")
+                            if old_sl is None or new_sl < old_sl:
+                                trade["trailing_sl"] = new_sl
+                                changed = True
+                                print(f"📉 TRAIL: #{trade['id']} {symbol} SL → ${new_sl:,.2f}")
+                elif raw_move_pct >= TRAILING_BE_TRIGGER_PCT:
+                    if trade.get("trailing_sl") != trade.get("entry_price"):
+                        trade["trailing_sl"] = trade.get("entry_price")
+                        changed = True
+                        print(f"🔒 BREAK-EVEN: #{trade['id']} {symbol} SL → entry")
+
+                # 2b) Enforce trailing stop: close if price breaches the locked SL.
+                sl = trade.get("trailing_sl")
+                if sl is not None:
+                    breached = (
+                        (trade.get("direction") == "LONG" and live_price <= sl)
+                        or (trade.get("direction") == "SHORT" and live_price >= sl)
+                    )
+                    if breached:
+                        trade_id = trade["id"]
+                        finalize_trade(trade, live_price)
+                        trade["close_reason"] = "trailing_stop"
+                        data["active"].remove(trade)
+                        data["history"].append(trade)
+                        changed = True
+                        print(f"🛑 TRAILING STOP HIT: #{trade_id} {symbol} at ${live_price:,.2f}")
+                        if is_chat_id_configured():
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=CHAT_ID,
+                                    text=(f"🛑 <b>TRAILING STOP HIT</b>\n\n"
+                                          f"Trade: <b>#{trade_id}</b> {symbol} {trade.get('direction')}\n"
+                                          f"Exit: ${live_price:,.2f}\n"
+                                          f"P&amp;L: {trade.get('pnl_pct', 0):+.2f}% "
+                                          f"(${trade.get('pnl_usd', 0):+,.2f})"),
+                                    parse_mode="HTML",
+                                )
+                            except Exception as exc:
+                                print(f"❌ ERROR sending trailing-stop alert for {trade_id}: {exc}")
+                        continue
+
+                # 3) Time-decay rotation: stale trade (>4h, P&L in [-2%, +1.5%]) → auto close.
+                age_hours = calc_trade_age_hours(trade)
+                if (age_hours > TIME_DECAY_MAX_HOURS
+                        and TIME_DECAY_MIN_PNL_PCT <= pnl_pct <= TIME_DECAY_MAX_PNL_PCT):
+                    trade_id = trade["id"]
+                    finalize_trade(trade, live_price)
+                    trade["close_reason"] = "time_decay_rotation"
+                    data["active"].remove(trade)
+                    data["history"].append(trade)
+                    changed = True
+                    print(f"♻️ TIME-DECAY ROTATION: closed #{trade_id} {symbol} "
+                          f"({age_hours:.1f}h, {pnl_pct:+.2f}%) to free capital.")
+                    if is_chat_id_configured():
+                        try:
+                            await context.bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=(f"♻️ <b>TIME-DECAY ROTATION</b>\n\n"
+                                      f"Trade: <b>#{trade_id}</b> {symbol} {trade.get('direction')}\n"
+                                      f"Held: {age_hours:.1f}h · P&amp;L: {pnl_pct:+.2f}%\n"
+                                      f"Exit: ${live_price:,.2f}\n"
+                                      f"<i>Capital freed for stronger signals.</i>"),
+                                parse_mode="HTML",
+                            )
+                        except Exception as exc:
+                            print(f"❌ ERROR sending rotation alert for {trade_id}: {exc}")
+                    continue
+            except Exception as exc:
+                print(f"❌ ERROR in trailing/time-decay logic for {trade.get('id')}: {exc}")
+
+        df = await asyncio.to_thread(fetch_klines, symbol, "15m", 300)
         result = analyze_indicators(df)
         if result is None:
             continue
@@ -1011,6 +1347,11 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
 
     if changed:
         save_trades(data)
+        try:
+            webapp_cache["portfolio"] = load_trades().get("active", [])
+            webapp_cache["performance"] = calculate_performance()
+        except Exception:
+            pass
 
 
 async def fetch_crypto_news(symbol, limit=3):
@@ -1486,7 +1827,7 @@ def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h"):
 
 def welcome_text():
     return (
-        "🌌 <b>ARIA CRYPTO ENGINE v3.0</b> 🌌\n"
+        "🌌 <b>ARIA CRYPTO ENGINE v6.0</b> 🌌\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Your AI-powered trading concierge.\n\n"
         "✨ <b>Commands</b> ✨\n"
@@ -1494,6 +1835,7 @@ def welcome_text():
         "📊 <code>/analyze [symbol]</code> — analysis + chart\n"
         "📈 <code>/trade SYM LONG/SHORT [lev]</code> — paper trade\n"
         "💼 <code>/portfolio</code> — positions &amp; P&amp;L\n"
+        "📊 <code>/performance</code> — win-rate &amp; P&amp;L stats\n"
         "🔔 <code>/alert SYM price</code> — price alert\n"
         "📋 <code>/myalerts</code> — your alerts\n"
         "🧮 <code>/risk capital risk% entry sl</code> — position size\n"
@@ -1502,6 +1844,7 @@ def welcome_text():
         "🐋 <code>/whales</code> — whale movements (24h)\n"
         "📰 <code>/news [symbol]</code> — news &amp; sentiment\n"
         "🔥 <code>/signals</code> — high-confidence scanner\n\n"
+        "🤖 <i>Quant Auto-Trader scans 50+ coins every 5 min.</i>\n\n"
         "⚡ <i>Use the menu below.</i>"
     )
 
@@ -1531,6 +1874,10 @@ def main_menu_keyboard():
         [
             InlineKeyboardButton("☀️ Daily Brief", callback_data="daily"),
             InlineKeyboardButton("❓ Help & Guide", callback_data="help"),
+        ],
+        [
+            InlineKeyboardButton("📊 Performance", callback_data="performance"),
+            InlineKeyboardButton("🤖 Auto-Trader", callback_data="autotrader"),
         ],
     ])
 
@@ -1758,7 +2105,7 @@ async def build_daily_summary():
         print(f"❌ ERROR in daily summary (news): {exc}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("⚡ <i>Generated by Aria Crypto Engine v3.0</i>")
+    lines.append("⚡ <i>Generated by Aria Crypto Engine v6.0</i>")
     return "\n".join(lines)
 
 
@@ -1931,6 +2278,17 @@ async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         build_portfolio_report(),
         parse_mode="HTML",
         reply_markup=portfolio_keyboard() or main_menu_keyboard(),
+    )
+
+
+async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await asyncio.to_thread(build_performance_message)
+    except Exception as exc:
+        print(f"❌ ERROR in /performance: {exc}")
+        text = "⚠️ <b>Performance metrics unavailable.</b> Try again later."
+    await update.message.reply_text(
+        text, parse_mode="HTML", reply_markup=submenu_keyboard()
     )
 
 
@@ -2405,6 +2763,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text, parse_mode="HTML", reply_markup=submenu_keyboard()
             )
 
+        elif data == "performance":
+            try:
+                text = await asyncio.to_thread(build_performance_message)
+            except Exception as exc:
+                print(f"❌ ERROR in performance button: {exc}")
+                text = "⚠️ <b>Performance metrics unavailable.</b> Try again later."
+            await query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=submenu_keyboard()
+            )
+
+        elif data == "autotrader":
+            try:
+                perf = await asyncio.to_thread(calculate_performance)
+                n_active = perf.get("open_positions_count", 0)
+            except Exception:
+                n_active = len(load_trades().get("active", []))
+            await query.edit_message_text(
+                "🤖 <b>QUANT AUTO-TRADER v6.0</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📡 Universe: <b>{len(SUPPORTED_SYMBOLS)} coins</b>\n"
+                f"⏱️ Scan: <b>every 5 min</b> · Confidence ≥ <b>{AUTO_TRADE_MIN_CONFIDENCE}%</b>\n"
+                f"📦 Open: <b>{n_active}/{MAX_ACTIVE_TRADES}</b>\n"
+                "🛡️ Trailing stop + time-decay rotation <b>ON</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Tap 📊 Performance for live win-rate &amp; P&amp;L.",
+                parse_mode="HTML", reply_markup=submenu_keyboard(),
+            )
+
         elif data == "help":
             await query.edit_message_text(
                 welcome_text(), parse_mode="HTML", reply_markup=main_menu_keyboard()
@@ -2663,6 +3049,7 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
         data = {
             "prices": [],
             "signals": [],
+            "performance": {},
             "fear_greed": {},
             "whales": [],
             "news": [],
@@ -2670,14 +3057,28 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
             "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
-        for symbol in SUPPORTED_SYMBOLS[:5]:
+        # Top 10 active prices (lightweight 24h ticker).
+        for symbol in SUPPORTED_SYMBOLS[:10]:
             ticker = fetch_24h_ticker_data(symbol)
             if ticker:
                 data["prices"].append(ticker)
 
-            result = scan_symbol(symbol)
+        # Full-universe signal scan (top signals by confidence first).
+        for symbol in SUPPORTED_SYMBOLS:
+            try:
+                result = scan_symbol(symbol)
+            except Exception as exc:
+                print(f"❌ ERROR scanning {symbol} for webapp cache — {exc}")
+                result = None
             if result:
                 data["signals"].append(result)
+        data["signals"].sort(key=lambda r: r.get("confidence", 0), reverse=True)
+
+        try:
+            data["performance"] = calculate_performance()
+        except Exception as exc:
+            print(f"❌ ERROR computing performance for webapp cache — {exc}")
+            data["performance"] = {}
 
         value, classification = fetch_fear_greed()
         data["fear_greed"] = {"value": value, "classification": classification}
@@ -2726,6 +3127,7 @@ def main():
     application.add_handler(CommandHandler("analyze", analyze_command))
     application.add_handler(CommandHandler("trade", trade_command))
     application.add_handler(CommandHandler("portfolio", portfolio_command))
+    application.add_handler(CommandHandler("performance", performance_command))
     application.add_handler(CommandHandler("close", close_command))
     application.add_handler(CommandHandler("whales", whales_command))
     application.add_handler(CommandHandler("news", news_command))
@@ -2741,6 +3143,7 @@ def main():
     application.job_queue.run_repeating(whale_tracker_loop, interval=120, first=10)
     application.job_queue.run_repeating(check_price_alerts, interval=30, first=5)
     application.job_queue.run_repeating(position_monitor_loop, interval=60, first=15)
+    application.job_queue.run_repeating(auto_trader_loop, interval=300, first=30)
     application.job_queue.run_repeating(update_webapp_cache_loop, interval=60, first=5)
 
     threading.Thread(target=run_flask, daemon=True).start()
