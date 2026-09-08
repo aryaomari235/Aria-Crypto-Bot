@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -23,6 +24,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -232,18 +238,31 @@ SUPPORTED_SYMBOLS = [
 SYMBOL_DISPLAY = {s: s.replace("USDT", "/USDT") for s in SUPPORTED_SYMBOLS}
 SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
 
-# --- Quant Auto-Trader v6.0 Engine Config ---
+# --- Quant Auto-Trader v8.0 Engine Config ---
 MAX_ACTIVE_TRADES = 5
 AUTO_TRADE_MIN_CONFIDENCE = 80
 AUTO_TRADE_LEVERAGE = 5
+AI_TRADE_LEVERAGE = 10  # default leverage for Gemini AI auto-trades
 AUTO_TRADE_NOTIONAL = 1000.0
 AUTO_TRADE_TIMEFRAMES = ["15m", "1h", "4h"]
-TRAILING_BE_TRIGGER_PCT = 3.0    # lock SL at break-even
-TRAILING_TRAIL_TRIGGER_PCT = 7.0  # trail SL to current - 1.5*ATR
+TRAILING_BE_TRIGGER_PCT = 3.0    # lock SL at break-even (levered P&L%)
+TRAILING_TRAIL_TRIGGER_PCT = 8.0  # trail SL once levered P&L% >= 8%
+TRAILING_PEAK_LOCK_RATIO = 0.6   # lock in at least 60% of peak profit
 TRAILING_ATR_MULT = 1.5
 TIME_DECAY_MAX_HOURS = 4.0
 TIME_DECAY_MIN_PNL_PCT = -2.0
 TIME_DECAY_MAX_PNL_PCT = 1.5
+
+# --- Gemini AI Decision Engine Config ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL_NAME = "gemini-1.5-flash"
+GEMINI_TIMEOUT = 20  # seconds per AI request
+GEMINI_COOLDOWN_SECONDS = 900  # 15-min backoff after rate-limit errors
+GEMINI_MAX_CALLS_PER_SCAN = 10  # cap paid/rate-limited calls per 5-min scan
+AI_TRADE_LOG_FILE = "ai_trader_log.json"
+AI_TRADE_LOG_MAX = 100
+_GEMINI_MODEL = None
+_GEMINI_COOLDOWN_UNTIL = 0.0
 
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
@@ -1135,16 +1154,289 @@ def build_performance_message():
     )
 
 
+def load_ai_logs():
+    """Load Gemini AI decision log (newest last, capped at AI_TRADE_LOG_MAX)."""
+    try:
+        with open(AI_TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+            logs = json.load(f)
+            return logs if isinstance(logs, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def append_ai_log(entry):
+    """Append one AI decision entry, keeping the log bounded."""
+    logs = load_ai_logs()
+    logs.append(entry)
+    if len(logs) > AI_TRADE_LOG_MAX:
+        logs = logs[-AI_TRADE_LOG_MAX:]
+    try:
+        with open(AI_TRADE_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(logs, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        print(f"❌ ERROR saving AI trade log — {exc}")
+    return entry
+
+
+def get_recent_ai_logs(limit=20):
+    return load_ai_logs()[-limit:]
+
+
+def gemini_ai_status():
+    """Fail-safe status snapshot for the Mini App (never raises)."""
+    return {
+        "configured": bool(GEMINI_API_KEY) and genai is not None,
+        "model": GEMINI_MODEL_NAME,
+        "cooldown_active": time.monotonic() < _GEMINI_COOLDOWN_UNTIL,
+        "last_updated": _now_iso(),
+    }
+
+
+def _get_gemini_model():
+    """Return a cached GenerativeModel, or None if AI is unavailable."""
+    global _GEMINI_MODEL
+    if genai is None or not GEMINI_API_KEY:
+        return None
+    if time.monotonic() < _GEMINI_COOLDOWN_UNTIL:
+        return None
+    if _GEMINI_MODEL is None:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            _GEMINI_MODEL = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        except Exception as exc:
+            print(f"❌ ERROR initializing Gemini model — {exc}")
+            return None
+    return _GEMINI_MODEL
+
+
+def _mark_gemini_rate_limited(exc):
+    """Enter cooldown when Gemini reports rate-limit/quota errors."""
+    global _GEMINI_COOLDOWN_UNTIL
+    text = str(exc).lower()
+    if any(k in text for k in ("429", "quota", "rate limit", "ratelimit",
+                               "resourceexhausted", "resource exhausted", "503", "overloaded")):
+        _GEMINI_COOLDOWN_UNTIL = time.monotonic() + GEMINI_COOLDOWN_SECONDS
+        print(f"⏳ Gemini rate-limited — cooling down for {GEMINI_COOLDOWN_SECONDS // 60} min. "
+              f"Using fallback reasoning.")
+        return True
+    return False
+
+
+def _call_gemini_sync(prompt):
+    """Blocking Gemini call (always run via asyncio.to_thread)."""
+    model = _get_gemini_model()
+    if model is None:
+        raise RuntimeError("gemini_unavailable")
+    response = model.generate_content(
+        prompt, request_options={"timeout": GEMINI_TIMEOUT}
+    )
+    return getattr(response, "text", "") or ""
+
+
+def parse_ai_decision_json(text):
+    """Strictly parse Gemini's JSON decision; return None if invalid."""
+    if not text or not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    # Strip markdown code fences if the model adds them.
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(cleaned[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    decision = str(parsed.get("decision", "")).upper().strip()
+    if decision not in ("LONG", "SHORT", "HOLD"):
+        return None
+    try:
+        confidence = int(float(parsed.get("confidence", 0)))
+    except (TypeError, ValueError):
+        return None
+    confidence = max(50, min(98, confidence))
+    reason = str(parsed.get("reason", "")).strip()[:500] or "No reason provided."
+    try:
+        sl_pct = float(parsed.get("sl_pct", 1.5))
+        sl_pct = sl_pct if 0 < sl_pct < 50 else 1.5
+    except (TypeError, ValueError):
+        sl_pct = 1.5
+    try:
+        tp_pct = float(parsed.get("tp_pct", 3.0))
+        tp_pct = tp_pct if 0 < tp_pct < 100 else 3.0
+    except (TypeError, ValueError):
+        tp_pct = 3.0
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "reason": reason,
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+    }
+
+
+def fallback_ai_decision(symbol, result):
+    """Deterministic local reasoning when Gemini is unavailable/rate-limited."""
+    signal = (result or {}).get("signal", "HOLD")
+    confidence = int((result or {}).get("confidence", 50) or 50)
+    confidence = max(50, min(98, confidence))
+    if signal == "STRONG BUY":
+        decision = "LONG"
+    elif signal == "STRONG SELL":
+        decision = "SHORT"
+    else:
+        decision = "HOLD"
+    rsi = (result or {}).get("rsi")
+    rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "n/a"
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "reason": (f"Fallback engine: local {signal} consensus (RSI {rsi_txt}) "
+                   f"used while Gemini AI is unreachable."),
+        "sl_pct": 1.5,
+        "tp_pct": 3.0,
+        "source": "fallback",
+    }
+
+
+def build_gemini_prompt(symbol, result):
+    """Construct the Gemini trade-decision prompt from technical indicators."""
+    price = (result or {}).get("price")
+    rsi = (result or {}).get("rsi")
+    macd_info = (result or {}).get("macd") or {}
+    ema50 = (result or {}).get("ema50")
+    ema200 = (result or {}).get("ema200")
+    boll = (result or {}).get("boll") or {}
+    price_txt = f"{price:,.4f}" if isinstance(price, (int, float)) else "n/a"
+    rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "n/a"
+    cross = macd_info.get("cross") or "NEUTRAL"
+    vol_ok = bool((result or {}).get("vol_ok"))
+    ema_txt = (
+        f"EMA50 {ema50:,.2f} / EMA200 {ema200:,.2f}"
+        if isinstance(ema50, (int, float)) and isinstance(ema200, (int, float))
+        else "EMA n/a"
+    )
+    bb_txt = (
+        f"BB upper {boll.get('upper'):,.2f} / lower {boll.get('lower'):,.2f}"
+        if isinstance(boll.get("upper"), (int, float)) else "BB n/a"
+    )
+    return (
+        f"Analyze this coin data: Symbol {symbol}, Price {price_txt}, RSI {rsi_txt}, "
+        f"MACD Cross {cross}, Volume Spike {vol_ok}. "
+        f"Trend context: {ema_txt}. {bb_txt}. "
+        f"Local signal: {(result or {}).get('signal', 'HOLD')} "
+        f"({(result or {}).get('confidence', 50)}% confidence). "
+        "Respond strictly in JSON format: "
+        "{'decision': 'LONG'|'SHORT'|'HOLD', 'confidence': 50-98, "
+        "'reason': '2-sentence AI analysis', 'sl_pct': 1.5, 'tp_pct': 3.0}"
+    )
+
+
+async def get_gemini_decision(symbol, result):
+    """Ask Gemini for a trade decision with fail-safe local fallback.
+
+    Always returns a validated dict with source 'gemini' or 'fallback'.
+    Never raises — every failure path degrades to fallback_ai_decision.
+    """
+    try:
+        prompt = build_gemini_prompt(symbol, result)
+        try:
+            raw = await asyncio.to_thread(_call_gemini_sync, prompt)
+        except RuntimeError:
+            return fallback_ai_decision(symbol, result)
+        except Exception as exc:
+            _mark_gemini_rate_limited(exc)
+            print(f"⚠️ Gemini call failed for {symbol} — {exc}. Using fallback.")
+            return fallback_ai_decision(symbol, result)
+        parsed = parse_ai_decision_json(raw)
+        if parsed is None:
+            print(f"⚠️ Gemini returned unparsable output for {symbol}. Using fallback.")
+            return fallback_ai_decision(symbol, result)
+        parsed["source"] = "gemini"
+        return parsed
+    except Exception as exc:
+        print(f"❌ ERROR in get_gemini_decision for {symbol} — {exc}")
+        return fallback_ai_decision(symbol, result)
+
+
+def trailing_sl_for_locked_profit(entry_price, direction, leverage, locked_profit_frac):
+    """Convert a locked profit fraction into a stop-loss price.
+
+    locked_profit_frac is levered (e.g. 0.048 = +4.8% P&L). Returns None on
+    invalid inputs so callers can skip safely.
+    """
+    try:
+        entry = float(entry_price)
+        lev = float(leverage)
+        locked = float(locked_profit_frac)
+        if entry <= 0 or lev <= 0 or locked < 0:
+            return None
+        if direction == "LONG":
+            return entry * (1 + locked / lev)
+        if direction == "SHORT":
+            return entry * (1 - locked / lev)
+        return None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_trailing_states():
+    """Active trailing-stop states snapshot for the Mini App (no network)."""
+    states = []
+    try:
+        for t in load_trades().get("active", []):
+            states.append({
+                "id": t.get("id"),
+                "symbol": t.get("symbol"),
+                "direction": t.get("direction"),
+                "entry_price": t.get("entry_price"),
+                "stop_loss": t.get("trailing_sl"),
+                "break_even_locked": bool(t.get("break_even_locked")),
+                "peak_pnl_pct": t.get("peak_pnl_pct", 0.0),
+                "is_auto": bool(t.get("is_auto", t.get("auto", False))),
+            })
+    except Exception as exc:
+        print(f"❌ ERROR building trailing states — {exc}")
+    return states
+
+
+def refresh_trading_cache():
+    """Refresh portfolio/performance/AI sections of webapp_cache (never raises)."""
+    try:
+        webapp_cache["portfolio"] = load_trades().get("active", [])
+    except Exception:
+        pass
+    try:
+        webapp_cache["performance"] = calculate_performance()
+    except Exception:
+        pass
+    try:
+        webapp_cache["ai_logs"] = get_recent_ai_logs(20)
+        webapp_cache["auto_trades"] = [
+            e for e in load_ai_logs() if e.get("executed")
+        ][-10:]
+        webapp_cache["trailing_states"] = build_trailing_states()
+        webapp_cache["ai_status"] = gemini_ai_status()
+    except Exception:
+        pass
+
+
 async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
-    """Quant Auto-Trader v6.0 execution engine — scans 50+ coins every 5 min."""
+    """Quant Auto-Trader v8.0 — Gemini AI decisions on top coins every 5 min."""
     try:
         data = load_trades()
-        active = data.get("active", [])
-        if len(active) >= MAX_ACTIVE_TRADES:
-            print(f"🤖 AUTO-TRADER: max active trades ({MAX_ACTIVE_TRADES}) reached — skipping scan.")
+        if len(data.get("active", [])) >= MAX_ACTIVE_TRADES:
+            print(f"🤖 AUTO-TRADER: max auto-trades ({MAX_ACTIVE_TRADES}) reached — skipping scan.")
             return
 
-        open_symbols = {t.get("symbol") for t in active}
+        gemini_calls = 0
 
         for symbol in SUPPORTED_SYMBOLS:
             # Re-check capacity inside the loop (a fill earlier in this scan counts).
@@ -1155,57 +1447,126 @@ async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
             if symbol in {t.get("symbol") for t in active}:
                 continue
 
-            ok, info = await asyncio.to_thread(check_mtf_confluence, symbol)
-            if not ok or not info:
+            # Stage 1 — gather technicals (1h) + cheap local pre-screen so we
+            # only spend rate-limited Gemini calls on genuine candidates.
+            try:
+                df_1h = await asyncio.to_thread(fetch_klines, symbol, "1h", 300)
+                result = analyze_indicators(df_1h)
+            except Exception as exc:
+                print(f"❌ ERROR gathering technicals for {symbol} — {exc}")
+                continue
+            if result is None:
+                continue
+            if result.get("signal") not in ("STRONG BUY", "STRONG SELL"):
+                continue
+            if int(result.get("confidence") or 0) < 75:
                 continue
 
-            signal = info["signal"]
-            confidence = info["confidence"]
-            direction = "LONG" if signal == "STRONG BUY" else "SHORT"
-            price = info.get("price") or await asyncio.to_thread(get_price, symbol)
+            # Stage 1b — multi-timeframe confluence (15m + 4h must agree).
+            try:
+                df_15m = await asyncio.to_thread(fetch_klines, symbol, "15m", 300)
+                df_4h = await asyncio.to_thread(fetch_klines, symbol, "4h", 300)
+                direction_hint = ("bullish" if result["signal"] == "STRONG BUY"
+                                  else "bearish")
+                badge = confluence_badge(
+                    direction_hint, [timeframe_trend(df_15m), timeframe_trend(df_4h)]
+                )
+            except Exception as exc:
+                print(f"❌ ERROR in MTF check for {symbol} — {exc}")
+                continue
+            if badge != "🟢":
+                continue
+
+            # Stage 2 — Gemini AI decision (capped per scan; fallback is automatic).
+            if gemini_calls >= GEMINI_MAX_CALLS_PER_SCAN:
+                print(f"🤖 AUTO-TRADER: Gemini call budget spent — skipping {symbol}.")
+                continue
+            gemini_calls += 1
+            ai = await get_gemini_decision(symbol, result)
+
+            decision = ai.get("decision", "HOLD")
+            confidence = int(ai.get("confidence", 0) or 0)
+            reason = ai.get("reason", "")
+            source = ai.get("source", "fallback")
+            price = result.get("price") or await asyncio.to_thread(get_price, symbol)
+
+            log_entry = {
+                "timestamp": _now_iso(),
+                "symbol": symbol,
+                "price": price,
+                "decision": decision,
+                "confidence": confidence,
+                "reason": reason,
+                "sl_pct": ai.get("sl_pct", 1.5),
+                "tp_pct": ai.get("tp_pct", 3.0),
+                "source": source,
+                "executed": False,
+                "trade_id": None,
+            }
+
+            # Stage 3 — execute only on high-confidence directional AI calls.
+            if decision not in ("LONG", "SHORT") or confidence < AUTO_TRADE_MIN_CONFIDENCE:
+                append_ai_log(log_entry)
+                continue
             if price is None:
+                append_ai_log(log_entry)
+                continue
+
+            # Final capacity + duplicate guard (state may have changed).
+            data = load_trades()
+            active = data.get("active", [])
+            if len(active) >= MAX_ACTIVE_TRADES:
+                append_ai_log(log_entry)
+                break
+            if symbol in {t.get("symbol") for t in active}:
+                append_ai_log(log_entry)
                 continue
 
             trade = await asyncio.to_thread(
-                open_trade, symbol, direction,
-                AUTO_TRADE_LEVERAGE, price, AUTO_TRADE_NOTIONAL,
+                open_trade, symbol, decision,
+                AI_TRADE_LEVERAGE, price, AUTO_TRADE_NOTIONAL,
             )
-            # Tag auto-trades for transparency (rotation/trailing logic + UI).
+            # Tag the trade as AI-driven with its reasoning (both key styles
+            # for backwards compatibility with older readers).
             try:
                 _d = load_trades()
                 for _t in _d.get("active", []):
                     if _t.get("id") == trade.get("id"):
+                        _t["is_auto"] = True
                         _t["auto"] = True
-                        _t["signal"] = signal
-                        _t["confidence"] = confidence
+                        _t["ai_reason"] = reason
+                        _t["ai_confidence"] = confidence
+                        _t["ai_source"] = source
+                        _t["ai_sl_pct"] = ai.get("sl_pct", 1.5)
+                        _t["ai_tp_pct"] = ai.get("tp_pct", 3.0)
                         break
                 save_trades(_d)
             except Exception as exc:
-                print(f"❌ ERROR tagging auto-trade {trade.get('id')}: {exc}")
+                print(f"❌ ERROR tagging AI auto-trade {trade.get('id')}: {exc}")
 
-            print(f"🤖 AUTO-TRADE EXECUTED: {direction} {symbol} at ${price:,.2f} "
-                  f"({signal} {confidence}%)")
+            log_entry["executed"] = True
+            log_entry["trade_id"] = trade.get("id")
+            append_ai_log(log_entry)
+
+            print(f"🤖 AI AUTO-TRADE EXECUTED: {decision} {symbol} at ${price:,.2f} "
+                  f"(conf {confidence}%, via {source})")
 
             if is_chat_id_configured():
                 display = symbol.replace("USDT", "/USDT")
                 message = (
-                    f"🤖 <b>AUTO-TRADE OPENED</b>\n\n"
+                    f"🤖 <b>AI AUTO-TRADE EXECUTED!</b>\n\n"
                     f"Symbol: {display}\n"
-                    f"Direction: {direction} x{AUTO_TRADE_LEVERAGE}\n"
+                    f"Direction: {decision} x{AI_TRADE_LEVERAGE}\n"
                     f"Price: ${price:,.2f}\n"
-                    f"Signal: {signal} ({confidence}%)\n"
-                    f"ID: #{trade.get('id')}"
+                    f"Confidence: {confidence}%\n"
+                    f"AI Reason: {reason}"
                 )
                 try:
                     await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML")
                 except Exception as exc:
-                    print(f"❌ ERROR sending auto-trade alert for {symbol}: {exc}")
+                    print(f"❌ ERROR sending AI auto-trade alert for {symbol}: {exc}")
 
-            webapp_cache["portfolio"] = load_trades().get("active", [])
-            try:
-                webapp_cache["performance"] = calculate_performance()
-            except Exception:
-                pass
+            refresh_trading_cache()
     except Exception as exc:
         print(f"❌ ERROR in auto_trader_loop: {exc}")
 
@@ -1243,39 +1604,38 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
                     print(f"❌ ERROR sending liquidation alert for {trade_id}: {exc}")
                 continue
 
-            # 2) Smart trailing stop (unleveraged move % so 3%/7% map to price action).
+            # 2) Smart trailing stop on live levered P&L%.
+            #  Break-even: P&L >= +3% → SL to entry (locked once).
+            #  Trailing:   P&L >= +8% → SL locks >=60% of peak profit (ratchets only).
             try:
-                entry = float(trade.get("entry_price") or 0)
-                raw_move_pct = 0.0
-                if entry > 0:
-                    if trade.get("direction") == "LONG":
-                        raw_move_pct = (live_price - entry) / entry * 100
-                    else:
-                        raw_move_pct = (entry - live_price) / entry * 100
+                if pnl_pct >= TRAILING_BE_TRIGGER_PCT and not trade.get("break_even_locked"):
+                    trade["trailing_sl"] = trade.get("entry_price")
+                    trade["break_even_locked"] = True
+                    changed = True
+                    print(f"🔒 BREAK-EVEN LOCKED: #{trade['id']} {symbol} SL → entry "
+                          f"(P&L {pnl_pct:+.2f}%)")
 
-                if raw_move_pct >= TRAILING_TRAIL_TRIGGER_PCT:
-                    df_atr = await asyncio.to_thread(fetch_klines, symbol, "1h", 100)
-                    atr = calculate_atr(df_atr) if not df_atr.empty else None
-                    if atr and atr > 0:
-                        if trade.get("direction") == "LONG":
-                            new_sl = live_price - TRAILING_ATR_MULT * atr
-                            old_sl = trade.get("trailing_sl")
-                            if old_sl is None or new_sl > old_sl:
-                                trade["trailing_sl"] = new_sl
-                                changed = True
-                                print(f"📈 TRAIL: #{trade['id']} {symbol} SL → ${new_sl:,.2f}")
-                        else:
-                            new_sl = live_price + TRAILING_ATR_MULT * atr
-                            old_sl = trade.get("trailing_sl")
-                            if old_sl is None or new_sl < old_sl:
-                                trade["trailing_sl"] = new_sl
-                                changed = True
-                                print(f"📉 TRAIL: #{trade['id']} {symbol} SL → ${new_sl:,.2f}")
-                elif raw_move_pct >= TRAILING_BE_TRIGGER_PCT:
-                    if trade.get("trailing_sl") != trade.get("entry_price"):
-                        trade["trailing_sl"] = trade.get("entry_price")
+                if pnl_pct >= TRAILING_TRAIL_TRIGGER_PCT:
+                    peak = float(trade.get("peak_pnl_pct", 0.0) or 0.0)
+                    if pnl_pct > peak:
+                        trade["peak_pnl_pct"] = round(pnl_pct, 2)
+                        peak = pnl_pct
                         changed = True
-                        print(f"🔒 BREAK-EVEN: #{trade['id']} {symbol} SL → entry")
+                    locked_frac = (TRAILING_PEAK_LOCK_RATIO * peak) / 100.0
+                    new_sl = trailing_sl_for_locked_profit(
+                        trade.get("entry_price"), trade.get("direction"),
+                        trade.get("leverage", 1), locked_frac,
+                    )
+                    if new_sl is not None:
+                        old_sl = trade.get("trailing_sl")
+                        better = (old_sl is None
+                                  or (trade.get("direction") == "LONG" and new_sl > old_sl)
+                                  or (trade.get("direction") == "SHORT" and new_sl < old_sl))
+                        if better:
+                            trade["trailing_sl"] = new_sl
+                            changed = True
+                            print(f"📈 TRAIL: #{trade['id']} {symbol} SL → ${new_sl:,.2f} "
+                                  f"(locks {TRAILING_PEAK_LOCK_RATIO:.0%} of {peak:.2f}% peak)")
 
                 # 2b) Enforce trailing stop: close if price breaches the locked SL.
                 sl = trade.get("trailing_sl")
@@ -1351,6 +1711,37 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
             or (direction == "SHORT" and signal in ("BUY", "STRONG BUY"))
         )
 
+        # 4) AI auto-close on violent reversal: STRONG consensus flip at high
+        #  confidence against the position → close immediately to protect capital.
+        violent = (
+            (direction == "LONG" and signal == "STRONG SELL")
+            or (direction == "SHORT" and signal == "STRONG BUY")
+        ) and int(confidence or 0) >= AUTO_TRADE_MIN_CONFIDENCE
+        if violent:
+            trade_id = trade["id"]
+            finalize_trade(trade, price)
+            trade["close_reason"] = "ai_reversal_close"
+            data["active"].remove(trade)
+            data["history"].append(trade)
+            changed = True
+            print(f"🛡️ AI Auto-Closed Position to Protect Capital: #{trade_id} "
+                  f"{symbol} {direction} — flipped to {signal} ({confidence}%)")
+            if is_chat_id_configured():
+                try:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(f"🛡️ <b>AI Auto-Closed Position to Protect Capital</b>\n\n"
+                              f"Trade: <b>#{trade_id}</b> {symbol} {direction}\n"
+                              f"Signal flipped to <b>{signal}</b> ({confidence}%)\n"
+                              f"Exit: ${price:,.2f}\n"
+                              f"P&amp;L: {trade.get('pnl_pct', 0):+.2f}% "
+                              f"(${trade.get('pnl_usd', 0):+,.2f})"),
+                        parse_mode="HTML",
+                    )
+                except Exception as exc:
+                    print(f"❌ ERROR sending AI reversal-close alert for {trade_id}: {exc}")
+            continue
+
         warned = trade.get("warning_triggered", False)
 
         if reversal and not warned:
@@ -1376,11 +1767,7 @@ async def position_monitor_loop(context: ContextTypes.DEFAULT_TYPE):
 
     if changed:
         save_trades(data)
-        try:
-            webapp_cache["portfolio"] = load_trades().get("active", [])
-            webapp_cache["performance"] = calculate_performance()
-        except Exception:
-            pass
+        refresh_trading_cache()
 
 
 async def fetch_crypto_news(symbol, limit=3):
@@ -1856,7 +2243,7 @@ def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h"):
 
 def welcome_text():
     return (
-        "🌌 <b>ARIA CRYPTO ENGINE v6.0</b> 🌌\n"
+        "🌌 <b>ARIA CRYPTO ENGINE v8.0</b> 🌌\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Your AI-powered trading concierge.\n\n"
         "✨ <b>Commands</b> ✨\n"
@@ -1873,7 +2260,7 @@ def welcome_text():
         "🐋 <code>/whales</code> — whale movements (24h)\n"
         "📰 <code>/news [symbol]</code> — news &amp; sentiment\n"
         "🔥 <code>/signals</code> — high-confidence scanner\n\n"
-        "🤖 <i>Quant Auto-Trader scans 50+ coins every 5 min.</i>\n\n"
+        "🤖 <i>Gemini AI Quant Auto-Trader scans 50+ coins every 5 min.</i>\n\n"
         "⚡ <i>Use the menu below.</i>"
     )
 
@@ -2134,7 +2521,7 @@ async def build_daily_summary():
         print(f"❌ ERROR in daily summary (news): {exc}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("⚡ <i>Generated by Aria Crypto Engine v6.0</i>")
+    lines.append("⚡ <i>Generated by Aria Crypto Engine v8.0</i>")
     return "\n".join(lines)
 
 
@@ -2809,8 +3196,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 n_active = len(load_trades().get("active", []))
             await query.edit_message_text(
-                "🤖 <b>QUANT AUTO-TRADER v6.0</b>\n"
+                "🤖 <b>QUANT AUTO-TRADER v8.0</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧠 AI: <b>Gemini {GEMINI_MODEL_NAME}</b> "
+                f"({'ON' if gemini_ai_status()['configured'] else 'FALLBACK MODE'})\n"
                 f"📡 Universe: <b>{len(SUPPORTED_SYMBOLS)} coins</b>\n"
                 f"⏱️ Scan: <b>every 5 min</b> · Confidence ≥ <b>{AUTO_TRADE_MIN_CONFIDENCE}%</b>\n"
                 f"📦 Open: <b>{n_active}/{MAX_ACTIVE_TRADES}</b>\n"
@@ -3133,6 +3522,10 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
             "whales": [],
             "news": [],
             "portfolio": [],
+            "ai_logs": [],
+            "auto_trades": [],
+            "trailing_states": [],
+            "ai_status": {},
             "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
@@ -3168,6 +3561,16 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
         data["news"] = _fetch_rss_news_sync(5)
 
         data["portfolio"] = load_trades().get("active", [])
+
+        # Auto-trader AI transparency: decision logs, executions, trailing states.
+        try:
+            all_ai_logs = load_ai_logs()
+            data["ai_logs"] = all_ai_logs[-20:]
+            data["auto_trades"] = [e for e in all_ai_logs if e.get("executed")][-10:]
+            data["trailing_states"] = build_trailing_states()
+            data["ai_status"] = gemini_ai_status()
+        except Exception as exc:
+            print(f"❌ ERROR building AI cache sections — {exc}")
 
         return data
 
