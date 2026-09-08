@@ -219,15 +219,15 @@ CHAT_ID = "758980281"
 SUPPORTED_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
     "ADAUSDT", "XRPUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT",
-    "NEARUSDT", "AVAXUSDT", "MATICUSDT", "SUIUSDT", "APTUSDT",
-    "FETUSDT", "SHIBUSDT", "PEPEUSDT", "RENDERUSDT", "INJUSDT",
-    "OPUSDT", "ARBUSDT", "TIAUSDT", "SEIUSDT", "ATOMUSDT",
-    "FILUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "GALAUSDT",
-    "ETCUSDT", "TRXUSDT", "TONUSDT", "UNIUSDT", "AAVEUSDT",
-    "MKRUSDT", "SNXUSDT", "STXUSDT", "IMXUSDT", "LDOUSDT",
-    "HBARUSDT", "VETUSDT", "ALGOUSDT", "FTMUSDT", "ARUSDT",
-    "JUPUSDT", "WLDUSDT", "PYTHUSDT", "ONDOUSDT", "JASMYUSDT",
-    "ENAUSDT", "TAOUSDT",
+    "AVAXUSDT", "NEARUSDT", "PEPEUSDT", "ARBUSDT", "OPUSDT",
+    "MATICUSDT", "ATOMUSDT", "APTUSDT", "SUIUSDT", "INJUSDT",
+    "FETUSDT", "RENDERUSDT", "TAOUSDT", "WLDUSDT", "SHIBUSDT",
+    "BONKUSDT", "WIFUSDT", "FLOKIUSDT", "UNIUSDT", "AAVEUSDT",
+    "MKRUSDT", "CRVUSDT", "LDOUSDT", "JUPUSDT", "PYTHUSDT",
+    "ONDOUSDT", "SEIUSDT", "TIAUSDT", "STXUSDT", "FILUSDT",
+    "ARUSDT", "GRTUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT",
+    "GALAUSDT", "CHZUSDT", "ETCUSDT", "TRXUSDT", "TONUSDT",
+    "HBARUSDT", "VETUSDT", "JASMYUSDT", "ENAUSDT",
 ]
 SYMBOL_DISPLAY = {s: s.replace("USDT", "/USDT") for s in SUPPORTED_SYMBOLS}
 SHORT_MAP = {s.replace("USDT", ""): s for s in SUPPORTED_SYMBOLS}
@@ -275,8 +275,37 @@ SYMBOL_KEYWORDS = {
     "TIAUSDT": ["tia", "celestia"],
     "SEIUSDT": ["sei"],
     "ATOMUSDT": ["atom", "cosmos"],
+    "TAOUSDT": ["tao", "bittensor"],
+    "WLDUSDT": ["wld", "worldcoin"],
+    "BONKUSDT": ["bonk"],
+    "WIFUSDT": ["wif", "dogwifhat"],
+    "FLOKIUSDT": ["floki"],
+    "UNIUSDT": ["uni", "uniswap"],
+    "AAVEUSDT": ["aave"],
+    "MKRUSDT": ["mkr", "maker"],
+    "CRVUSDT": ["crv", "curve"],
+    "LDOUSDT": ["ldo", "lido"],
+    "JUPUSDT": ["jup", "jupiter"],
+    "PYTHUSDT": ["pyth", "pyth network"],
+    "ONDOUSDT": ["ondo"],
+    "STXUSDT": ["stx", "stacks"],
+    "FILUSDT": ["fil", "filecoin"],
+    "ARUSDT": ["ar", "arweave"],
+    "GRTUSDT": ["grt", "the graph", "graph"],
+    "SANDUSDT": ["sand", "sandbox"],
+    "MANAUSDT": ["mana", "decentraland"],
+    "AXSUSDT": ["axs", "axie"],
+    "GALAUSDT": ["gala"],
+    "CHZUSDT": ["chz", "chiliz"],
+    "ETCUSDT": ["etc", "ethereum classic"],
+    "TRXUSDT": ["trx", "tron"],
+    "TONUSDT": ["ton", "toncoin"],
+    "HBARUSDT": ["hbar", "hedera"],
+    "VETUSDT": ["vet", "vechain"],
+    "JASMYUSDT": ["jasmy"],
+    "ENAUSDT": ["ena", "ethena"],
 }
-# Auto-fill keywords for remaining symbols so news filtering works for all 50+.
+# Auto-fill keywords for any remaining symbols so news filtering never breaks.
 for _sym in SUPPORTED_SYMBOLS:
     if _sym not in SYMBOL_KEYWORDS:
         _base = _sym.replace("USDT", "").lower()
@@ -3042,6 +3071,56 @@ def fetch_24h_ticker_data(symbol):
         return None
 
 
+def fetch_all_24h_tickers(symbols=None):
+    """Fetch 24h tickers for ALL symbols in ONE batch request (maximum speed).
+
+    Calls Binance `/api/v3/ticker/24hr` with no params to get the full array,
+    then filters to the requested symbols (defaults to SUPPORTED_SYMBOLS).
+    Returns a list of {symbol, display, price, change_24h} dicts in the
+    requested symbol order. Falls back to per-symbol requests on failure.
+    """
+    wanted = list(symbols) if symbols is not None else list(SUPPORTED_SYMBOLS)
+    try:
+        response = requests.get(
+            "https://data-api.binance.vision/api/v3/ticker/24hr",
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        all_tickers = response.json()
+        by_symbol = {t.get("symbol"): t for t in all_tickers if isinstance(t, dict)}
+        results = []
+        for symbol in wanted:
+            t = by_symbol.get(symbol)
+            if t is None:
+                continue
+            try:
+                results.append({
+                    "symbol": symbol,
+                    "display": symbol.replace("USDT", "/USDT"),
+                    "price": float(t["lastPrice"]),
+                    "change_24h": float(t["priceChangePercent"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        # Fill any gaps via single-symbol fallback so no coin is ever missing.
+        missing = [s for s in wanted if s not in {r["symbol"] for r in results}]
+        for symbol in missing:
+            single = fetch_24h_ticker_data(symbol)
+            if single:
+                results.append(single)
+        order = {s: i for i, s in enumerate(wanted)}
+        results.sort(key=lambda r: order.get(r["symbol"], len(order)))
+        return results
+    except Exception as exc:
+        print(f"❌ ERROR: batch 24h ticker fetch failed — {exc}")
+        results = []
+        for symbol in wanted:
+            single = fetch_24h_ticker_data(symbol)
+            if single:
+                results.append(single)
+        return results
+
+
 async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
     global webapp_cache
 
@@ -3057,11 +3136,12 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
             "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
-        # Top 10 active prices (lightweight 24h ticker).
-        for symbol in SUPPORTED_SYMBOLS[:10]:
-            ticker = fetch_24h_ticker_data(symbol)
-            if ticker:
-                data["prices"].append(ticker)
+        # Live prices for the ENTIRE directory — one batch Binance request.
+        try:
+            data["prices"] = fetch_all_24h_tickers(SUPPORTED_SYMBOLS)
+        except Exception as exc:
+            print(f"❌ ERROR fetching batch prices for webapp cache — {exc}")
+            data["prices"] = []
 
         # Full-universe signal scan (top signals by confidence first).
         for symbol in SUPPORTED_SYMBOLS:
