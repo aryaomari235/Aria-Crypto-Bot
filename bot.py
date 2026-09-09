@@ -255,18 +255,20 @@ TIME_DECAY_MIN_PNL_PCT = -2.0
 TIME_DECAY_MAX_PNL_PCT = 1.5
 
 # --- Gemini AI Decision Engine Config ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# Optional in-source fallback: paste your key between the quotes below ONLY if
-# environment variables are unavailable (env var takes precedence when set).
+GEMINI_MODEL_NAME = "gemini-1.5-flash"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# Hardcoded fallback: ALWAYS used directly when the env variable is empty.
 GEMINI_API_KEY_FALLBACK = "AQ.Ab8RN6KZ1wvjTby6Ngd_43lZMJzludI_cKJvMZORPYOgwiPX2A"
 if not GEMINI_API_KEY:
     GEMINI_API_KEY = GEMINI_API_KEY_FALLBACK
 if genai is not None and GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
+        print(f"🧠 Gemini AI Initialized (Model: {GEMINI_MODEL_NAME})")
     except Exception as exc:
         print(f"⚠️ Gemini module-level configure failed — {exc}")
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
+else:
+    print("⚠️ Gemini AI NOT initialized (missing library or API key) — fallback reasoning active.")
 GEMINI_TIMEOUT = 20  # seconds per AI request
 GEMINI_COOLDOWN_SECONDS = 900  # 15-min backoff after rate-limit errors
 GEMINI_MAX_CALLS_PER_SCAN = 10  # cap paid/rate-limited calls per 5-min scan
