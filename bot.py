@@ -264,6 +264,13 @@ AI_TRADE_LOG_MAX = 100
 _GEMINI_MODEL = None
 _GEMINI_COOLDOWN_UNTIL = 0.0
 
+# --- LunarCrush Social Sentiment Config (fused into Gemini AI decisions) ---
+LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY", "")
+LUNARCRUSH_BASE_URL = "https://lunarcrush.com/api4"
+# Galaxy Score >= this counts as strong social bullishness for fusion nudges.
+SOCIAL_GALAXY_BULLISH = 75
+SOCIAL_GALAXY_BEARISH = 35
+
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
 webapp_cache = {}
@@ -1282,8 +1289,214 @@ def parse_ai_decision_json(text):
     }
 
 
-def fallback_ai_decision(symbol, result):
-    """Deterministic local reasoning when Gemini is unavailable/rate-limited."""
+def fetch_lunarcrush_snapshot():
+    """Fetch social metrics for ALL coins in ONE LunarCrush batch request.
+
+    Calls `GET /public/coins/list/v1` (Bearer auth) and returns a dict keyed
+    by base asset, e.g. {"BTC": {"galaxy_score": 82, ...}}. Returns {} on ANY
+    failure (no key, network error, unexpected schema) so the AI engine
+    always degrades gracefully to pure-technical decisions. Run via
+    asyncio.to_thread — it is blocking.
+    """
+    if not LUNARCRUSH_API_KEY:
+        return {}
+    try:
+        response = requests.get(
+            f"{LUNARCRUSH_BASE_URL}/public/coins/list/v1",
+            headers={"Authorization": f"Bearer {LUNARCRUSH_API_KEY}"},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        print(f"⚠️ LunarCrush snapshot failed — {exc}. Continuing without social data.")
+        return {}
+
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return {}
+
+    snapshot = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        base = str(item.get("symbol", "")).upper().strip()
+        if not base:
+            continue
+        try:
+            entry = {
+                "galaxy_score": float(item.get("galaxy_score")) if item.get("galaxy_score") is not None else None,
+                "alt_rank": int(item.get("alt_rank")) if item.get("alt_rank") is not None else None,
+                "sentiment": float(item.get("sentiment")) if item.get("sentiment") is not None else None,
+                "social_volume_24h": item.get("social_volume_24h", item.get("volume_24h")),
+                "mentions": item.get("social_mentions", item.get("mentions")),
+                "mentions_prev": item.get("social_mentions_previous", item.get("mentions_previous")),
+            }
+        except (TypeError, ValueError):
+            continue
+        # Mentions spike % vs previous period (e.g. +240% = 2.4x surge).
+        spike = None
+        try:
+            cur, prev = entry["mentions"], entry["mentions_prev"]
+            if cur is not None and prev not in (None, 0):
+                spike = (float(cur) - float(prev)) / float(prev) * 100.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            spike = None
+        entry["mentions_spike_pct"] = spike
+        snapshot[base] = entry
+    return snapshot
+
+
+def get_social_context(symbol, snapshot):
+    """Extract per-symbol social context from a LunarCrush snapshot.
+
+    Returns None when social data is unavailable. Otherwise a dict with
+    galaxy_score, alt_rank, sentiment, social_volume_24h, mentions_spike_pct,
+    a bullish/bearish/neutral stance and source 'lunarcrush'.
+    """
+    if not snapshot or not symbol:
+        return None
+    entry = snapshot.get(symbol.replace("USDT", "").upper())
+    if not entry or entry.get("galaxy_score") is None:
+        return None
+    galaxy = float(entry["galaxy_score"])
+    if galaxy >= SOCIAL_GALAXY_BULLISH:
+        stance = "bullish"
+    elif galaxy <= SOCIAL_GALAXY_BEARISH:
+        stance = "bearish"
+    else:
+        stance = "neutral"
+    return {
+        "galaxy_score": round(galaxy, 1),
+        "alt_rank": entry.get("alt_rank"),
+        "sentiment": entry.get("sentiment"),
+        "social_volume_24h": entry.get("social_volume_24h"),
+        "mentions_spike_pct": (round(entry["mentions_spike_pct"], 1)
+                               if entry.get("mentions_spike_pct") is not None else None),
+        "stance": stance,
+        "source": "lunarcrush",
+    }
+
+
+def synthetic_social_sentiment(symbol):
+    """Derive a synthetic sentiment score from 24h volume change + momentum.
+
+    Key-free fallback using Binance market data: 24h price momentum from 1h
+    klines plus recent-vs-prior 24h volume ratio. Returns a social-shaped dict
+    with source 'synthetic', or None if market data is unavailable.
+    """
+    try:
+        df = fetch_klines(symbol, interval="1h", limit=49)
+        if df.empty or len(df) < 25:
+            return None
+        closes = df["Close"].to_numpy()
+        volumes = df["Volume"].to_numpy()
+        ref = float(closes[-25])
+        last = float(closes[-1])
+        if ref <= 0:
+            return None
+        momentum_pct = (last - ref) / ref * 100.0
+        prev_vol = float(volumes[:-24].mean()) if len(volumes) > 24 else 0.0
+        cur_vol = float(volumes[-24:].mean())
+        spike = ((cur_vol - prev_vol) / prev_vol * 100.0) if prev_vol > 0 else 0.0
+
+        galaxy = 50.0 + max(-20.0, min(20.0, momentum_pct * 2.0))
+        galaxy += 10.0 if spike >= 100.0 else (5.0 if spike >= 50.0 else 0.0)
+        galaxy -= 10.0 if spike <= -50.0 else 0.0
+        galaxy = max(1.0, min(99.0, galaxy))
+        if galaxy >= SOCIAL_GALAXY_BULLISH:
+            stance = "bullish"
+        elif galaxy <= SOCIAL_GALAXY_BEARISH:
+            stance = "bearish"
+        else:
+            stance = "neutral"
+        return {
+            "galaxy_score": round(galaxy, 1),
+            "alt_rank": None,
+            "sentiment": None,
+            "social_volume_24h": None,
+            "mentions_spike_pct": round(spike, 1),
+            "stance": stance,
+            "source": "synthetic",
+        }
+    except Exception as exc:
+        print(f"⚠️ Synthetic sentiment failed for {symbol} — {exc}")
+        return None
+
+
+def fetch_social_sentiment(symbol):
+    """Fetch social sentiment metrics for ONE symbol (fail-safe, never raises).
+
+    Primary: LunarCrush `/public/coins/{asset}/v1` (needs LUNARCRUSH_API_KEY),
+    extracting galaxy_score, alt_rank and social_volume_24h. Fallback: local
+    synthetic score derived from 24h volume change + price momentum. Returns
+    a social context dict or None if every source fails.
+    """
+    base = (symbol or "").replace("USDT", "").upper()
+    if not base:
+        return None
+    if LUNARCRUSH_API_KEY:
+        try:
+            response = requests.get(
+                f"{LUNARCRUSH_BASE_URL}/public/coins/{base}/v1",
+                headers={"Authorization": f"Bearer {LUNARCRUSH_API_KEY}"},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if isinstance(data, dict) and data.get("galaxy_score") is not None:
+                galaxy = float(data["galaxy_score"])
+                stance = ("bullish" if galaxy >= SOCIAL_GALAXY_BULLISH
+                          else "bearish" if galaxy <= SOCIAL_GALAXY_BEARISH
+                          else "neutral")
+                alt = data.get("alt_rank")
+                return {
+                    "galaxy_score": round(galaxy, 1),
+                    "alt_rank": int(alt) if alt is not None else None,
+                    "sentiment": (float(data["sentiment"])
+                                  if data.get("sentiment") is not None else None),
+                    "social_volume_24h": data.get("social_volume_24h",
+                                                  data.get("volume_24h")),
+                    "mentions_spike_pct": None,
+                    "stance": stance,
+                    "source": "lunarcrush",
+                }
+        except Exception as exc:
+            print(f"⚠️ LunarCrush per-coin fetch failed for {symbol} — {exc}. "
+                  f"Using synthetic sentiment.")
+    return synthetic_social_sentiment(symbol)
+
+
+def format_social_line(social):
+    """One-line social summary for prompts and logs (LunarCrush or synthetic)."""
+    if not social:
+        return "Social Sentiment: unavailable."
+    parts = [f"Galaxy Score {social.get('galaxy_score'):g}/100"]
+    if social.get("alt_rank") is not None:
+        parts.append(f"AltRank #{social['alt_rank']}")
+    spike = social.get("mentions_spike_pct")
+    if spike is not None:
+        parts.append(f"Social Volume Spike {spike:+.0f}%")
+    elif social.get("social_volume_24h") is not None:
+        parts.append(f"Social Volume 24h {social['social_volume_24h']}")
+    if social.get("sentiment") is not None:
+        parts.append(f"Sentiment {social['sentiment']:g}/100")
+    parts.append(f"stance: {social.get('stance', 'neutral')}")
+    if social.get("source") == "synthetic":
+        parts.append("source: synthetic (volume+momentum)")
+    return "Social Sentiment: " + ", ".join(parts) + "."
+
+
+def fallback_ai_decision(symbol, result, social=None):
+    """Deterministic local reasoning when Gemini is unavailable/rate-limited.
+
+    Fuses LunarCrush social stance as a confidence nudge (±5): aligned social
+    confirms the technical call, conflicting social tempers it. Direction is
+    NEVER flipped by social data — only Gemini may do that.
+    """
     signal = (result or {}).get("signal", "HOLD")
     confidence = int((result or {}).get("confidence", 50) or 50)
     confidence = max(50, min(98, confidence))
@@ -1295,19 +1508,36 @@ def fallback_ai_decision(symbol, result):
         decision = "HOLD"
     rsi = (result or {}).get("rsi")
     rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "n/a"
+    reason = (f"Fallback engine: local {signal} consensus (RSI {rsi_txt}) "
+              f"used while Gemini AI is unreachable.")
+    if social:
+        stance = social.get("stance", "neutral")
+        aligned = ((decision == "LONG" and stance == "bullish")
+                   or (decision == "SHORT" and stance == "bearish"))
+        conflicted = ((decision == "LONG" and stance == "bearish")
+                      or (decision == "SHORT" and stance == "bullish"))
+        if aligned:
+            confidence = min(98, confidence + 5)
+            reason += (f" Social confirms: Galaxy {social.get('galaxy_score'):g}/100 "
+                       f"({stance}).")
+        elif conflicted:
+            confidence = max(50, confidence - 5)
+            reason += (f" Social conflicts: Galaxy {social.get('galaxy_score'):g}/100 "
+                       f"({stance}) tempers confidence.")
+        else:
+            reason += f" Social neutral (Galaxy {social.get('galaxy_score'):g}/100)."
     return {
         "decision": decision,
         "confidence": confidence,
-        "reason": (f"Fallback engine: local {signal} consensus (RSI {rsi_txt}) "
-                   f"used while Gemini AI is unreachable."),
+        "reason": reason,
         "sl_pct": 1.5,
         "tp_pct": 3.0,
         "source": "fallback",
     }
 
 
-def build_gemini_prompt(symbol, result):
-    """Construct the Gemini trade-decision prompt from technical indicators."""
+def build_gemini_prompt(symbol, result, social=None):
+    """Construct the Gemini trade-decision prompt from technicals + socials."""
     price = (result or {}).get("price")
     rsi = (result or {}).get("rsi")
     macd_info = (result or {}).get("macd") or {}
@@ -1327,43 +1557,52 @@ def build_gemini_prompt(symbol, result):
         f"BB upper {boll.get('upper'):,.2f} / lower {boll.get('lower'):,.2f}"
         if isinstance(boll.get("upper"), (int, float)) else "BB n/a"
     )
+    spike = social.get("mentions_spike_pct") if social else None
+    spike_txt = f"{spike:+.0f}%" if isinstance(spike, (int, float)) else "n/a"
+    galaxy_txt = f"{social.get('galaxy_score'):g}/100" if social else "n/a"
+    alt_txt = f"#{social['alt_rank']}" if social and social.get("alt_rank") is not None else "n/a"
     return (
-        f"Analyze this coin data: Symbol {symbol}, Price {price_txt}, RSI {rsi_txt}, "
-        f"MACD Cross {cross}, Volume Spike {vol_ok}. "
+        f"Technical Data: Symbol {symbol}, RSI {rsi_txt}, MACD {cross}, Price {price_txt}. "
+        f"Social Sentiment: Galaxy Score {galaxy_txt}, AltRank {alt_txt}, "
+        f"Social Volume Spike {spike_txt}. "
         f"Trend context: {ema_txt}. {bb_txt}. "
+        f"Volume Spike {vol_ok}. "
         f"Local signal: {(result or {}).get('signal', 'HOLD')} "
         f"({(result or {}).get('confidence', 50)}% confidence). "
+        "Analyze BOTH technical and social sentiment to decide trade direction "
+        "(LONG/SHORT/HOLD) and confidence score. "
         "Respond strictly in JSON format: "
         "{'decision': 'LONG'|'SHORT'|'HOLD', 'confidence': 50-98, "
         "'reason': '2-sentence AI analysis', 'sl_pct': 1.5, 'tp_pct': 3.0}"
     )
 
 
-async def get_gemini_decision(symbol, result):
+async def get_gemini_decision(symbol, result, social=None):
     """Ask Gemini for a trade decision with fail-safe local fallback.
 
-    Always returns a validated dict with source 'gemini' or 'fallback'.
-    Never raises — every failure path degrades to fallback_ai_decision.
+    `social` is an optional LunarCrush context dict (or None) fused into both
+    the Gemini prompt and the fallback path. Always returns a validated dict
+    with source 'gemini' or 'fallback'. Never raises.
     """
     try:
-        prompt = build_gemini_prompt(symbol, result)
+        prompt = build_gemini_prompt(symbol, result, social)
         try:
             raw = await asyncio.to_thread(_call_gemini_sync, prompt)
         except RuntimeError:
-            return fallback_ai_decision(symbol, result)
+            return fallback_ai_decision(symbol, result, social)
         except Exception as exc:
             _mark_gemini_rate_limited(exc)
             print(f"⚠️ Gemini call failed for {symbol} — {exc}. Using fallback.")
-            return fallback_ai_decision(symbol, result)
+            return fallback_ai_decision(symbol, result, social)
         parsed = parse_ai_decision_json(raw)
         if parsed is None:
             print(f"⚠️ Gemini returned unparsable output for {symbol}. Using fallback.")
-            return fallback_ai_decision(symbol, result)
+            return fallback_ai_decision(symbol, result, social)
         parsed["source"] = "gemini"
         return parsed
     except Exception as exc:
         print(f"❌ ERROR in get_gemini_decision for {symbol} — {exc}")
-        return fallback_ai_decision(symbol, result)
+        return fallback_ai_decision(symbol, result, social)
 
 
 def trailing_sl_for_locked_profit(entry_price, direction, leverage, locked_profit_frac):
@@ -1438,6 +1677,13 @@ async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
 
         gemini_calls = 0
 
+        # Social layer: one LunarCrush batch snapshot per scan ({} if no key).
+        try:
+            social_snapshot = await asyncio.to_thread(fetch_lunarcrush_snapshot)
+        except Exception as exc:
+            print(f"⚠️ Social snapshot failed — {exc}. Continuing technical-only.")
+            social_snapshot = {}
+
         for symbol in SUPPORTED_SYMBOLS:
             # Re-check capacity inside the loop (a fill earlier in this scan counts).
             data = load_trades()
@@ -1482,7 +1728,8 @@ async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
                 print(f"🤖 AUTO-TRADER: Gemini call budget spent — skipping {symbol}.")
                 continue
             gemini_calls += 1
-            ai = await get_gemini_decision(symbol, result)
+            social = get_social_context(symbol, social_snapshot)
+            ai = await get_gemini_decision(symbol, result, social)
 
             decision = ai.get("decision", "HOLD")
             confidence = int(ai.get("confidence", 0) or 0)
@@ -1500,6 +1747,7 @@ async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
                 "sl_pct": ai.get("sl_pct", 1.5),
                 "tp_pct": ai.get("tp_pct", 3.0),
                 "source": source,
+                "social": social,
                 "executed": False,
                 "trade_id": None,
             }
@@ -2152,7 +2400,14 @@ def run_analysis(symbol, timeframe="1h"):
 
     tp_sl = generate_atr_tp_sl(result["price"], result["atr"], result["signal"])
 
-    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe)
+    # Social layer for Telegram badges + Mini App (fail-safe: None on error).
+    try:
+        social = fetch_social_sentiment(symbol)
+    except Exception as exc:
+        print(f"⚠️ Social sentiment skipped for {symbol} — {exc}")
+        social = None
+
+    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe, social)
     chart_url = get_tradingview_chart_url(symbol, timeframe)
 
     return caption, chart_url, {
@@ -2175,10 +2430,31 @@ def run_analysis(symbol, timeframe="1h"):
         "bearish": result["bearish"],
         "signal": result["signal"],
         "confidence": result["confidence"],
+        "galaxy_score": social.get("galaxy_score") if social else None,
+        "alt_rank": social.get("alt_rank") if social else None,
+        "social_stance": social.get("stance") if social else None,
+        "social_source": social.get("source") if social else None,
     }
 
 
-def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h"):
+def format_galaxy_badge(social):
+    """Telegram badge text for Galaxy Score (marks synthetic estimates)."""
+    if not social or social.get("galaxy_score") is None:
+        return "N/A"
+    txt = f"{social['galaxy_score']:g}/100"
+    if social.get("source") == "synthetic":
+        txt += " ~"  # ~ flags a volume+momentum estimate, not LunarCrush live data
+    return txt
+
+
+def format_altrank_badge(social):
+    """Telegram badge text for AltRank."""
+    if not social or social.get("alt_rank") is None:
+        return "N/A"
+    return f"#{social['alt_rank']}"
+
+
+def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h", social=None):
     display = symbol.replace("USDT", "/USDT")
     price = result["price"]
     rsi = result["rsi"]
@@ -2225,6 +2501,8 @@ def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h"):
         f"   Upper: {bb_upper_txt} · Middle: {bb_mid_txt} · Lower: {bb_lower_txt}",
         f"📉 <b>EMA(50)</b>: {ema50_txt} · <b>EMA(200)</b>: {ema200_txt}",
         f"📊 <b>Volume Confirm</b>: {vol_txt} · <b>Pattern</b>: {pattern_txt}",
+        f"🌌 <b>Galaxy Score</b>: {format_galaxy_badge(social)} · "
+        f"🏅 <b>AltRank</b>: {format_altrank_badge(social)}",
     ]
 
     if tp_sl:
@@ -3526,6 +3804,7 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
             "auto_trades": [],
             "trailing_states": [],
             "ai_status": {},
+            "social": {},
             "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
@@ -3537,6 +3816,12 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
             data["prices"] = []
 
         # Full-universe signal scan (top signals by confidence first).
+        # One LunarCrush batch snapshot per cycle feeds per-coin social badges.
+        try:
+            social_snapshot = fetch_lunarcrush_snapshot()
+        except Exception as exc:
+            print(f"⚠️ Social snapshot failed for webapp cache — {exc}")
+            social_snapshot = {}
         for symbol in SUPPORTED_SYMBOLS:
             try:
                 result = scan_symbol(symbol)
@@ -3544,8 +3829,16 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
                 print(f"❌ ERROR scanning {symbol} for webapp cache — {exc}")
                 result = None
             if result:
+                try:
+                    result["social"] = get_social_context(symbol, social_snapshot)
+                except Exception:
+                    result["social"] = None
                 data["signals"].append(result)
         data["signals"].sort(key=lambda r: r.get("confidence", 0), reverse=True)
+        data["social"] = {
+            "snapshot_count": len(social_snapshot),
+            "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
 
         try:
             data["performance"] = calculate_performance()
