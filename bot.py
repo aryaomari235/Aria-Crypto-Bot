@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 import sys
@@ -1577,6 +1578,48 @@ def build_gemini_prompt(symbol, result, social=None):
     )
 
 
+GEMINI_REASONING_FALLBACK = "AI Reasoning unavailable."
+GEMINI_REASONING_MAX_CHARS = 500
+
+
+def generate_gemini_trade_reasoning(symbol, result, social=None):
+    """Get a live 2-sentence trading advice string from Gemini (sync).
+
+    Called from run_analysis AFTER technicals + Galaxy Score are known.
+    Returns the model's reasoning text, or "AI Reasoning unavailable." on
+    ANY failure (no key, rate limit with cooldown backoff, timeout,
+    empty/unparsable reply). Never raises.
+    """
+    try:
+        price = (result or {}).get("price")
+        rsi = (result or {}).get("rsi")
+        pattern = (result or {}).get("pattern") or "none"
+        price_txt = f"${price:,.2f}" if isinstance(price, (int, float)) else "n/a"
+        rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "n/a"
+        galaxy_txt = (f"{social['galaxy_score']:g}/100"
+                      if social and social.get("galaxy_score") is not None else "n/a")
+        prompt = (
+            f"You are an elite Quant. Data for {symbol}: Price {price_txt}, "
+            f"RSI {rsi_txt}, Pattern {pattern}, Galaxy Score {galaxy_txt}. "
+            f"Give a 2-sentence precise trading advice."
+        )
+        try:
+            raw = _call_gemini_sync(prompt)
+        except RuntimeError:
+            return GEMINI_REASONING_FALLBACK
+        except Exception as exc:
+            _mark_gemini_rate_limited(exc)
+            print(f"⚠️ Gemini reasoning failed for {symbol} — {exc}")
+            return GEMINI_REASONING_FALLBACK
+        text = " ".join(str(raw or "").split())
+        if not text:
+            return GEMINI_REASONING_FALLBACK
+        return text[:GEMINI_REASONING_MAX_CHARS]
+    except Exception as exc:
+        print(f"❌ ERROR in generate_gemini_trade_reasoning for {symbol} — {exc}")
+        return GEMINI_REASONING_FALLBACK
+
+
 async def get_gemini_decision(symbol, result, social=None):
     """Ask Gemini for a trade decision with fail-safe local fallback.
 
@@ -2407,7 +2450,14 @@ def run_analysis(symbol, timeframe="1h"):
         print(f"⚠️ Social sentiment skipped for {symbol} — {exc}")
         social = None
 
-    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe, social)
+    # Live Gemini reasoning (fail-safe: fallback string on any error).
+    try:
+        gemini_reason = generate_gemini_trade_reasoning(symbol, result, social)
+    except Exception as exc:
+        print(f"⚠️ Gemini reasoning skipped for {symbol} — {exc}")
+        gemini_reason = GEMINI_REASONING_FALLBACK
+
+    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe, social, gemini_reason)
     chart_url = get_tradingview_chart_url(symbol, timeframe)
 
     return caption, chart_url, {
@@ -2434,6 +2484,7 @@ def run_analysis(symbol, timeframe="1h"):
         "alt_rank": social.get("alt_rank") if social else None,
         "social_stance": social.get("stance") if social else None,
         "social_source": social.get("source") if social else None,
+        "gemini_reason": gemini_reason,
     }
 
 
@@ -2454,7 +2505,8 @@ def format_altrank_badge(social):
     return f"#{social['alt_rank']}"
 
 
-def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h", social=None):
+def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h", social=None,
+                           gemini_reason=None):
     display = symbol.replace("USDT", "/USDT")
     price = result["price"]
     rsi = result["rsi"]
@@ -2515,6 +2567,9 @@ def build_analysis_caption(symbol, result, tp_sl, confluence, timeframe="1h", so
     lines.append(f"🐂 Bullish: <b>{bullish}</b> · 🐻 Bearish: <b>{bearish}</b>")
     lines.append(f"🚦 <b>Signal</b>: {SIGNAL_EMOJI[signal]} <b>{signal}</b>")
     lines.append(f"🧠 <b>AI Confidence</b>: <b>{confidence}%</b>")
+    # Live Gemini reasoning (HTML-escaped + truncated to respect caption limits).
+    reason_txt = html.escape(str(gemini_reason or GEMINI_REASONING_FALLBACK))[:280]
+    lines.append(f"🤖 <b>Gemini Trading Advice:</b> {reason_txt}")
 
     return "\n".join(lines)
 
