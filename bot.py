@@ -752,11 +752,25 @@ def confluence_badge(direction, tf_trends):
 
 
 def normalize_symbol(text):
-    """Standardize user input into a Binance USDT pair."""
+    """Standardize user input into a Binance USDT pair.
+
+    Exact-match only: full pairs and known short codes resolve via lookup
+    tables; anything else gets `+ "USDT"` appended verbatim. There is NO
+    default/fallback pair — an unresolvable input returns None instead of
+    ever mapping to the wrong coin.
+    """
     if not text:
         return None
 
+    # Strip common separators so 'WIF/USDT', 'wif-usdt', ' wif ' etc. resolve.
     symbol = text.strip().upper()
+    for sep in ("/", "-", "_", " ", "."):
+        symbol = symbol.replace(sep, "")
+    if not symbol:
+        return None
+    # Drop futures suffixes ('XRP-PERP' -> 'XRP'); no spot coin ends in PERP.
+    if symbol.endswith("PERP"):
+        symbol = symbol[:-4]
     if symbol in SUPPORTED_SYMBOLS:
         return symbol
     if symbol in SHORT_MAP:
@@ -1622,7 +1636,7 @@ def generate_gemini_reasoning(symbol, price, rsi, pattern, galaxy_score):
         return "Market shows mixed momentum; monitor key support and resistance levels carefully."
     except Exception as e:
         _mark_gemini_rate_limited(e)
-        print(f"❌ Gemini Error: {e}")
+        print(f"❌ Gemini API Error for {symbol}: {repr(e)}")
         return "Market shows mixed momentum; monitor key support and resistance levels carefully."
 
 
