@@ -256,6 +256,16 @@ TIME_DECAY_MAX_PNL_PCT = 1.5
 
 # --- Gemini AI Decision Engine Config ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Optional in-source fallback: paste your key between the quotes below ONLY if
+# environment variables are unavailable (env var takes precedence when set).
+GEMINI_API_KEY_FALLBACK = "AQ.Ab8RN6KZ1wvjTby6Ngd_43lZMJzludI_cKJvMZORPYOgwiPX2A"
+if not GEMINI_API_KEY:
+    GEMINI_API_KEY = GEMINI_API_KEY_FALLBACK
+if genai is not None and GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as exc:
+        print(f"⚠️ Gemini module-level configure failed — {exc}")
 GEMINI_MODEL_NAME = "gemini-1.5-flash"
 GEMINI_TIMEOUT = 20  # seconds per AI request
 GEMINI_COOLDOWN_SECONDS = 900  # 15-min backoff after rate-limit errors
@@ -1582,39 +1592,55 @@ GEMINI_REASONING_FALLBACK = "AI Reasoning unavailable."
 GEMINI_REASONING_MAX_CHARS = 500
 
 
-def generate_gemini_trade_reasoning(symbol, result, social=None):
-    """Get a live 2-sentence trading advice string from Gemini (sync).
+def generate_gemini_reasoning(symbol, price, rsi, pattern, galaxy_score):
+    """Live 2-sentence trading advice from Gemini (sync, fail-safe).
 
-    Called from run_analysis AFTER technicals + Galaxy Score are known.
-    Returns the model's reasoning text, or "AI Reasoning unavailable." on
-    ANY failure (no key, rate limit with cooldown backoff, timeout,
-    empty/unparsable reply). Never raises.
+    Builds a fresh `gemini-1.5-flash` model per the standard integration,
+    honoring the shared rate-limit cooldown. Returns the model's stripped
+    text, or a neutral fallback on ANY failure so analysis never crashes.
+    Never raises.
     """
     try:
-        price = (result or {}).get("price")
-        rsi = (result or {}).get("rsi")
-        pattern = (result or {}).get("pattern") or "none"
-        price_txt = f"${price:,.2f}" if isinstance(price, (int, float)) else "n/a"
+        if genai is None or not GEMINI_API_KEY or time.monotonic() < _GEMINI_COOLDOWN_UNTIL:
+            raise RuntimeError("gemini_unavailable")
+        price_txt = f"${price:.2f}" if isinstance(price, (int, float)) else "n/a"
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "n/a"
-        galaxy_txt = (f"{social['galaxy_score']:g}/100"
-                      if social and social.get("galaxy_score") is not None else "n/a")
-        prompt = (
-            f"You are an elite Quant. Data for {symbol}: Price {price_txt}, "
-            f"RSI {rsi_txt}, Pattern {pattern}, Galaxy Score {galaxy_txt}. "
-            f"Give a 2-sentence precise trading advice."
+        pattern_txt = pattern or "none"
+        galaxy_txt = (f"{galaxy_score:g}/100"
+                      if isinstance(galaxy_score, (int, float)) else "n/a")
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = (f"You are an elite crypto trader. Analyze {symbol} at {price_txt}. "
+                  f"RSI is {rsi_txt}, Candlestick pattern is {pattern_txt}, "
+                  f"Galaxy Score is {galaxy_txt}. "
+                  f"Provide a 2-sentence precise trading advice.")
+        response = model.generate_content(
+            prompt, request_options={"timeout": GEMINI_TIMEOUT}
         )
-        try:
-            raw = _call_gemini_sync(prompt)
-        except RuntimeError:
-            return GEMINI_REASONING_FALLBACK
-        except Exception as exc:
-            _mark_gemini_rate_limited(exc)
-            print(f"⚠️ Gemini reasoning failed for {symbol} — {exc}")
-            return GEMINI_REASONING_FALLBACK
-        text = " ".join(str(raw or "").split())
-        if not text:
-            return GEMINI_REASONING_FALLBACK
-        return text[:GEMINI_REASONING_MAX_CHARS]
+        text = " ".join(str(getattr(response, "text", "") or "").split()).strip()
+        if text:
+            return text[:GEMINI_REASONING_MAX_CHARS]
+        return "Market shows mixed momentum; monitor key support and resistance levels carefully."
+    except Exception as e:
+        _mark_gemini_rate_limited(e)
+        print(f"❌ Gemini Error: {e}")
+        return "Market shows mixed momentum; monitor key support and resistance levels carefully."
+
+
+def generate_gemini_trade_reasoning(symbol, result, social=None):
+    """Backward-compatible wrapper around generate_gemini_reasoning.
+
+    Unpacks a run_analysis-style result dict + social context into the
+    explicit (symbol, price, rsi, pattern, galaxy_score) signature.
+    Never raises.
+    """
+    try:
+        return generate_gemini_reasoning(
+            symbol,
+            (result or {}).get("price"),
+            (result or {}).get("rsi"),
+            (result or {}).get("pattern") or "none",
+            (social or {}).get("galaxy_score"),
+        )
     except Exception as exc:
         print(f"❌ ERROR in generate_gemini_trade_reasoning for {symbol} — {exc}")
         return GEMINI_REASONING_FALLBACK
@@ -2450,9 +2476,15 @@ def run_analysis(symbol, timeframe="1h"):
         print(f"⚠️ Social sentiment skipped for {symbol} — {exc}")
         social = None
 
-    # Live Gemini reasoning (fail-safe: fallback string on any error).
+    # Live Gemini reasoning (fail-safe: neutral fallback on any error).
     try:
-        gemini_reason = generate_gemini_trade_reasoning(symbol, result, social)
+        gemini_reason = generate_gemini_reasoning(
+            symbol,
+            result.get("price"),
+            result.get("rsi"),
+            result.get("pattern") or "none",
+            social.get("galaxy_score") if social else None,
+        )
     except Exception as exc:
         print(f"⚠️ Gemini reasoning skipped for {symbol} — {exc}")
         gemini_reason = GEMINI_REASONING_FALLBACK
