@@ -1,8 +1,10 @@
 import asyncio
+import atexit
 import html
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -16,7 +18,7 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
+from telegram.error import BadRequest, Conflict, Forbidden, TelegramError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -3976,7 +3978,128 @@ async def update_webapp_cache_loop(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ ERROR updating webapp cache: {exc}")
 
 
+# --- Single-instance guard (prevents telegram.error.Conflict) ---
+# Render can briefly run two processes during deploys/restarts; only one may
+# hold getUpdates. The RUN_MAIN env flag stops same-process-tree duplicates,
+# while the lock file below stops cross-process duplicates on one host.
+INSTANCE_LOCK_FILE = os.environ.get(
+    "BOT_LOCK_FILE", os.path.join(tempfile.gettempdir(), "aria-crypto-bot.lock")
+)
+INSTANCE_LOCK_STALE_SECONDS = 180
+_INSTANCE_LOCK_OWNED = False
+
+
+def _lock_holder_alive(pid):
+    """Best-effort check whether the lock-holding PID is still running.
+
+    Never uses os.kill (its Windows semantics are unreliable next to native
+    extensions): POSIX uses kill(pid, 0); Windows uses a side-effect-free
+    OpenProcess + WaitForSingleObject(0) existence check via ctypes.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if not handle:
+                return False
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) != 0  # 0 = exited
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (OSError, PermissionError):
+        return True  # cannot tell — assume alive
+    except Exception:
+        return True
+
+
+def _unlink_quietly(path, retries=5, delay=0.2):
+    """Remove a lock file, retrying transient Windows AV/indexer locks."""
+    for attempt in range(retries):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt < retries - 1:
+                time.sleep(delay)
+    return False
+
+
+def _release_instance_lock(path):
+    global _INSTANCE_LOCK_OWNED
+    if _INSTANCE_LOCK_OWNED:
+        if not _unlink_quietly(path):
+            print(f"⚠️ Could not remove instance lock {path}")
+        _INSTANCE_LOCK_OWNED = False
+
+
+def _acquire_instance_lock(path=INSTANCE_LOCK_FILE):
+    """Atomically claim the single-instance lock. Returns True if WE may poll.
+
+    No background threads: a lock is respected while its holder PID is alive
+    (or the file is fresh); a lock whose holder is dead — or whose file is
+    older than INSTANCE_LOCK_STALE_SECONDS (e.g. SIGKILL leftovers where the
+    PID check is inconclusive) — is taken over.
+    """
+    global _INSTANCE_LOCK_OWNED
+    payload = f"{os.getpid()}:{time.time()}".encode()
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+    except FileExistsError:
+        # Another process claims the lock — take over only if it is stale/dead.
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            pid = int(content.split(":")[0])
+            age = time.time() - os.path.getmtime(path)
+        except (ValueError, OSError, IndexError):
+            pid, age = 0, float("inf")
+        holder_alive = _lock_holder_alive(pid)
+        if holder_alive and age < INSTANCE_LOCK_STALE_SECONDS:
+            print(f"⛔ Another bot instance holds the lock (pid {pid}, "
+                  f"{age:.0f}s old) — exiting to avoid getUpdates Conflict.")
+            return False
+        why = "dead holder" if not holder_alive else "stale file"
+        print(f"🧹 Taking over instance lock ({why}: pid {pid}, {age:.0f}s old).")
+        if not _unlink_quietly(path):
+            print(f"⚠️ Could not clear stale lock {path}")
+            return False
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+        except FileExistsError:
+            print("⛔ Lost the lock race — another instance is polling. Exiting.")
+            return False
+    except Exception as exc:
+        print(f"⚠️ Instance lock unavailable — {exc}. Proceeding without guard.")
+        return True
+    _INSTANCE_LOCK_OWNED = True
+    atexit.register(_release_instance_lock, path)
+    return True
+
+
 def main():
+    # Guard 1: same-process-tree duplicates (reloader/double main()).
+    if os.environ.get("RUN_MAIN", "true") != "true":
+        print("⏸️ RUN_MAIN is not 'true' — polling already started. Skipping duplicate.")
+        return
+    os.environ["RUN_MAIN"] = "false"
+
+    # Guard 2: cross-process duplicates on this host (Render deploy overlap).
+    if not _acquire_instance_lock():
+        return
+
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
@@ -4028,7 +4151,15 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
     print("🌐 Flask server started on port 10000")
     print("🤖 Telegram Bot is online and listening...")
-    application.run_polling()
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Conflict as exc:
+        # Another getUpdates consumer (second instance/webhook) holds the bot.
+        print(f"⛔ Telegram Conflict — another instance is polling this token: {exc}")
+        print("   Fix: scale the Render service to 1 instance and stop any local runs.")
+    except Exception as exc:
+        print(f"❌ Polling stopped unexpectedly — {exc}")
+        raise
 
 
 if __name__ == "__main__":
