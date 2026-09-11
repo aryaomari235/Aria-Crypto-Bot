@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import hashlib
 import html
 import json
 import os
@@ -60,6 +61,102 @@ def keepalive_health():
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     keepalive_app.run(host="0.0.0.0", port=port)
+
+
+# --- Telegram webhook mode (primary) with polling fallback ---
+TELEGRAM_WEBHOOK_PATH = "/webhook"
+_ENGINE_LOOP = None
+_TELEGRAM_APP = None
+
+
+def get_public_base_url():
+    """Public HTTPS base URL for the webhook (Render sets RENDER_EXTERNAL_URL)."""
+    for var in ("WEBHOOK_URL", "RENDER_EXTERNAL_URL"):
+        value = os.environ.get(var, "").strip().rstrip("/")
+        if value:
+            return value
+    return None
+
+
+def get_webhook_secret():
+    """Stable secret validated against X-Telegram-Bot-Api-Secret-Token."""
+    explicit = os.environ.get("WEBHOOK_SECRET", "").strip()
+    if explicit:
+        return explicit
+    return hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()[:48]
+
+
+@keepalive_app.route(TELEGRAM_WEBHOOK_PATH, methods=["GET", "POST"])
+def telegram_webhook():
+    """Receive Telegram updates and hand them to the PTB application queue."""
+    if request.method == "GET":
+        return jsonify({
+            "status": "webhook endpoint",
+            "mode": "webhook" if get_public_base_url() else "polling",
+            "engine_ready": _TELEGRAM_APP is not None and _ENGINE_LOOP is not None,
+        })
+    app = _TELEGRAM_APP
+    loop = _ENGINE_LOOP
+    if app is None or loop is None or loop.is_closed():
+        # 503 → Telegram retries later, so no update is lost while engine boots.
+        return "engine starting", 503
+    secret = get_webhook_secret()
+    if secret and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+        return "forbidden", 403
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict) or not data:
+        return "bad request", 400
+    try:
+        update = Update.de_json(data, app.bot)
+        if update is None:
+            return "ignored", 200
+        loop.call_soon_threadsafe(app.update_queue.put_nowait, update)
+    except Exception as exc:
+        print(f"❌ ERROR queueing Telegram update — {exc}")
+        return "error", 500
+    return "ok", 200
+
+
+async def run_webhook_engine(application, base_url):
+    """Initialize PTB in webhook mode without run_polling().
+
+    `Application.start()` starts the JobQueue and the update-queue processor,
+    so every background loop (auto-trader, whale tracker, position monitor,
+    webapp cache) keeps running 24/7 while Flask serves the webhook route.
+    """
+    global _ENGINE_LOOP, _TELEGRAM_APP
+    _ENGINE_LOOP = asyncio.get_running_loop()
+    _TELEGRAM_APP = application
+
+    await application.initialize()
+    await application.start()
+    print("⏱️ Background engine started (JobQueue + update processor).")
+
+    webhook_url = f"{base_url}{TELEGRAM_WEBHOOK_PATH}"
+    try:
+        await application.bot.set_webhook(
+            url=webhook_url,
+            secret_token=get_webhook_secret(),
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        print(f"🪝 Telegram webhook registered: {webhook_url}")
+    except Exception as exc:
+        print(f"❌ ERROR registering Telegram webhook — {exc}")
+
+    try:
+        await asyncio.Event().wait()  # run forever; JobQueue keeps ticking
+    finally:
+        _TELEGRAM_APP = None
+        _ENGINE_LOOP = None
+        try:
+            await application.stop()
+        except Exception as exc:
+            print(f"⚠️ Application stop warning — {exc}")
+        try:
+            await application.shutdown()
+        except Exception as exc:
+            print(f"⚠️ Application shutdown warning — {exc}")
 
 
 @keepalive_app.route("/api/prices")
@@ -4092,7 +4189,7 @@ def _acquire_instance_lock(path=INSTANCE_LOCK_FILE):
 def main():
     # Guard 1: same-process-tree duplicates (reloader/double main()).
     if os.environ.get("RUN_MAIN", "true") != "true":
-        print("⏸️ RUN_MAIN is not 'true' — polling already started. Skipping duplicate.")
+        print("⏸️ RUN_MAIN is not 'true' — engine already started. Skipping duplicate.")
         return
     os.environ["RUN_MAIN"] = "false"
 
@@ -4100,7 +4197,20 @@ def main():
     if not _acquire_instance_lock():
         return
 
-    application = (
+    # Delivery mode: webhook (primary, requires public URL) or polling fallback.
+    base_url = get_public_base_url()
+    mode = os.environ.get("BOT_MODE", "auto").strip().lower()
+    if mode not in ("webhook", "polling", "auto"):
+        print(f"⚠️ Unknown BOT_MODE {mode!r} — using auto.")
+        mode = "auto"
+    if mode == "auto":
+        mode = "webhook" if base_url else "polling"
+    if mode == "webhook" and not base_url:
+        print("⚠️ Webhook mode has no WEBHOOK_URL/RENDER_EXTERNAL_URL — "
+              "falling back to polling.")
+        mode = "polling"
+
+    builder = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .read_timeout(30)
@@ -4111,8 +4221,11 @@ def main():
         .get_updates_write_timeout(30)
         .get_updates_connect_timeout(30)
         .get_updates_pool_timeout(30)
-        .build()
     )
+    if mode == "webhook":
+        # No updater: Flask receives updates and feeds application.update_queue.
+        builder = builder.updater(None)
+    application = builder.build()
 
     application.job_queue.scheduler.configure(
         job_defaults={
@@ -4150,7 +4263,16 @@ def main():
 
     threading.Thread(target=run_flask, daemon=True).start()
     print("🌐 Flask server started on port 10000")
-    print("🤖 Telegram Bot is online and listening...")
+
+    if mode == "webhook":
+        print(f"🪝 Telegram Bot online in WEBHOOK mode → {base_url}{TELEGRAM_WEBHOOK_PATH}")
+        try:
+            asyncio.run(run_webhook_engine(application, base_url))
+        except KeyboardInterrupt:
+            print("👋 Shutdown requested by user.")
+        return
+
+    print("🤖 Telegram Bot is online and listening (polling)...")
     try:
         application.run_polling(drop_pending_updates=True)
     except Conflict as exc:
