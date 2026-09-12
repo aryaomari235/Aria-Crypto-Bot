@@ -1712,26 +1712,6 @@ def generate_gemini_reasoning(symbol, price, rsi, pattern, galaxy_score):
         return fallback
 
 
-def generate_gemini_trade_reasoning(symbol, result, social=None):
-    """Backward-compatible wrapper around generate_gemini_reasoning.
-
-    Unpacks a run_analysis-style result dict + social context into the
-    explicit (symbol, price, rsi, pattern, galaxy_score) signature.
-    Never raises.
-    """
-    try:
-        return generate_gemini_reasoning(
-            symbol,
-            (result or {}).get("price"),
-            (result or {}).get("rsi"),
-            (result or {}).get("pattern") or "none",
-            (social or {}).get("galaxy_score"),
-        )
-    except Exception as exc:
-        print(f"❌ ERROR in generate_gemini_trade_reasoning for {symbol} — {exc}")
-        return GEMINI_REASONING_FALLBACK
-
-
 async def get_gemini_decision(symbol, result, social=None):
     """Ask Gemini for a trade decision with fail-safe local fallback.
 
@@ -2555,20 +2535,18 @@ def run_analysis(symbol, timeframe="1h"):
         print(f"⚠️ Social sentiment skipped for {symbol} — {exc}")
         social = None
 
-    # Live Gemini reasoning (fail-safe: neutral fallback on any error).
-    try:
-        gemini_reason = generate_gemini_reasoning(
-            symbol,
-            result.get("price"),
-            result.get("rsi"),
-            result.get("pattern") or "none",
-            social.get("galaxy_score") if social else None,
-        )
-    except Exception as exc:
-        print(f"⚠️ Gemini reasoning skipped for {symbol} — {exc}")
-        gemini_reason = GEMINI_REASONING_FALLBACK
+    # Live Gemini reasoning (fail-safe handling lives inside the function).
+    galaxy_score = social.get("galaxy_score") if social else None
+    gemini_reason = generate_gemini_reasoning(
+        symbol=symbol,
+        price=result["price"],
+        rsi=result["rsi"],
+        pattern=result["pattern"],
+        galaxy_score=galaxy_score,
+    )
 
-    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe, social, gemini_reason)
+    caption = build_analysis_caption(symbol, result, tp_sl, confluence, timeframe, social,
+                                     gemini_reason=gemini_reason)
     chart_url = get_tradingview_chart_url(symbol, timeframe)
 
     return caption, chart_url, {
