@@ -30,7 +30,7 @@ from telegram.ext import (
 )
 
 try:
-    import google.generativeai as genai
+    from google import genai
 except ImportError:
     genai = None
 
@@ -355,26 +355,21 @@ TIME_DECAY_MAX_PNL_PCT = 1.5
 
 # --- Gemini AI Decision Engine Config ---
 GEMINI_MODEL_NAME = "gemini-1.5-flash"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-# Hardcoded fallback: ALWAYS used directly when the env variable is empty.
-GEMINI_API_KEY_FALLBACK = "AQ.Ab8RN6KZ1wvjTby6Ngd_43lZMJzludI_cKJvMZORPYOgwiPX2A"
-if not GEMINI_API_KEY:
-    GEMINI_API_KEY = GEMINI_API_KEY_FALLBACK
-if genai is not None and GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        print(f"🧠 Gemini AI Initialized (Model: {GEMINI_MODEL_NAME})")
-    except Exception as exc:
-        print(f"⚠️ Gemini module-level configure failed — {exc}")
-else:
-    print("⚠️ Gemini AI NOT initialized (missing library or API key) — fallback reasoning active.")
-GEMINI_TIMEOUT = 20  # seconds per AI request
-GEMINI_COOLDOWN_SECONDS = 900  # 15-min backoff after rate-limit errors
-GEMINI_MAX_CALLS_PER_SCAN = 10  # cap paid/rate-limited calls per 5-min scan
+# Env var takes precedence; paste a key in the quotes at the end for direct use.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip() or "AQ.Ab8RN6IlYnQZGI8jC2LA6yy6MMVRvjAbD7nVIDE-nsnzXDQGFg"
 AI_TRADE_LOG_FILE = "ai_trader_log.json"
 AI_TRADE_LOG_MAX = 100
-_GEMINI_MODEL = None
-_GEMINI_COOLDOWN_UNTIL = 0.0
+
+# Official google-genai SDK: one shared client; None => fallback reasoning.
+gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        print(f"🧠 Gemini AI Initialized (Model: {GEMINI_MODEL_NAME})")
+    except Exception as exc:
+        print(f"⚠️ Gemini client init failed — {exc}")
+else:
+    print("⚠️ Gemini API key missing — fallback reasoning active.")
 
 # --- LunarCrush Social Sentiment Config (fused into Gemini AI decisions) ---
 LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY", "")
@@ -1318,50 +1313,25 @@ def get_recent_ai_logs(limit=20):
 def gemini_ai_status():
     """Fail-safe status snapshot for the Mini App (never raises)."""
     return {
-        "configured": bool(GEMINI_API_KEY) and genai is not None,
+        "configured": gemini_client is not None,
         "model": GEMINI_MODEL_NAME,
-        "cooldown_active": time.monotonic() < _GEMINI_COOLDOWN_UNTIL,
         "last_updated": _now_iso(),
     }
 
 
-def _get_gemini_model():
-    """Return a cached GenerativeModel, or None if AI is unavailable."""
-    global _GEMINI_MODEL
-    if genai is None or not GEMINI_API_KEY:
-        return None
-    if time.monotonic() < _GEMINI_COOLDOWN_UNTIL:
-        return None
-    if _GEMINI_MODEL is None:
-        try:
-            genai.configure(api_key=GEMINI_API_KEY)
-            _GEMINI_MODEL = genai.GenerativeModel(GEMINI_MODEL_NAME)
-        except Exception as exc:
-            print(f"❌ ERROR initializing Gemini model — {exc}")
-            return None
-    return _GEMINI_MODEL
-
-
-def _mark_gemini_rate_limited(exc):
-    """Enter cooldown when Gemini reports rate-limit/quota errors."""
-    global _GEMINI_COOLDOWN_UNTIL
-    text = str(exc).lower()
-    if any(k in text for k in ("429", "quota", "rate limit", "ratelimit",
-                               "resourceexhausted", "resource exhausted", "503", "overloaded")):
-        _GEMINI_COOLDOWN_UNTIL = time.monotonic() + GEMINI_COOLDOWN_SECONDS
-        print(f"⏳ Gemini rate-limited — cooling down for {GEMINI_COOLDOWN_SECONDS // 60} min. "
-              f"Using fallback reasoning.")
-        return True
-    return False
+def _get_gemini_client():
+    """Return the shared Gemini client, or None if AI is unavailable."""
+    return gemini_client
 
 
 def _call_gemini_sync(prompt):
     """Blocking Gemini call (always run via asyncio.to_thread)."""
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         raise RuntimeError("gemini_unavailable")
-    response = model.generate_content(
-        prompt, request_options={"timeout": GEMINI_TIMEOUT}
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=prompt,
     )
     return getattr(response, "text", "") or ""
 
@@ -1710,35 +1680,35 @@ GEMINI_REASONING_MAX_CHARS = 500
 def generate_gemini_reasoning(symbol, price, rsi, pattern, galaxy_score):
     """Live 2-sentence trading advice from Gemini (sync, fail-safe).
 
-    Builds a fresh `gemini-1.5-flash` model per the standard integration,
-    honoring the shared rate-limit cooldown. Returns the model's stripped
-    text, or a neutral fallback on ANY failure so analysis never crashes.
-    Never raises.
+    Uses the official google-genai SDK (`gemini_client.models.generate_content`).
+    Returns the model's stripped text, or a neutral fallback on ANY failure so
+    analysis never crashes. Never raises.
     """
+    fallback = "Market shows mixed momentum; monitor key support and resistance levels carefully."
+    if gemini_client is None:
+        return fallback
     try:
-        if genai is None or not GEMINI_API_KEY or time.monotonic() < _GEMINI_COOLDOWN_UNTIL:
-            raise RuntimeError("gemini_unavailable")
         price_txt = f"${price:.2f}" if isinstance(price, (int, float)) else "n/a"
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "n/a"
         pattern_txt = pattern or "none"
         galaxy_txt = (f"{galaxy_score:g}/100"
                       if isinstance(galaxy_score, (int, float)) else "n/a")
-        model = genai.GenerativeModel("gemini-1.5-flash")
         prompt = (f"You are an elite crypto trader. Analyze {symbol} at {price_txt}. "
                   f"RSI is {rsi_txt}, Candlestick pattern is {pattern_txt}, "
                   f"Galaxy Score is {galaxy_txt}. "
                   f"Provide a 2-sentence precise trading advice.")
-        response = model.generate_content(
-            prompt, request_options={"timeout": GEMINI_TIMEOUT}
+        # New SDK syntax:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
         )
-        text = " ".join(str(getattr(response, "text", "") or "").split()).strip()
+        text = (getattr(response, "text", "") or "").strip()
         if text:
             return text[:GEMINI_REASONING_MAX_CHARS]
-        return "Market shows mixed momentum; monitor key support and resistance levels carefully."
+        return fallback
     except Exception as e:
-        _mark_gemini_rate_limited(e)
-        print(f"❌ Gemini API Error for {symbol}: {repr(e)}")
-        return "Market shows mixed momentum; monitor key support and resistance levels carefully."
+        print(f"❌ Gemini SDK Error for {symbol}: {repr(e)}")
+        return fallback
 
 
 def generate_gemini_trade_reasoning(symbol, result, social=None):
@@ -1775,7 +1745,6 @@ async def get_gemini_decision(symbol, result, social=None):
         except RuntimeError:
             return fallback_ai_decision(symbol, result, social)
         except Exception as exc:
-            _mark_gemini_rate_limited(exc)
             print(f"⚠️ Gemini call failed for {symbol} — {exc}. Using fallback.")
             return fallback_ai_decision(symbol, result, social)
         parsed = parse_ai_decision_json(raw)
@@ -1859,8 +1828,6 @@ async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
             print(f"🤖 AUTO-TRADER: max auto-trades ({MAX_ACTIVE_TRADES}) reached — skipping scan.")
             return
 
-        gemini_calls = 0
-
         # Social layer: one LunarCrush batch snapshot per scan ({} if no key).
         try:
             social_snapshot = await asyncio.to_thread(fetch_lunarcrush_snapshot)
@@ -1907,11 +1874,7 @@ async def auto_trader_loop(context: ContextTypes.DEFAULT_TYPE):
             if badge != "🟢":
                 continue
 
-            # Stage 2 — Gemini AI decision (capped per scan; fallback is automatic).
-            if gemini_calls >= GEMINI_MAX_CALLS_PER_SCAN:
-                print(f"🤖 AUTO-TRADER: Gemini call budget spent — skipping {symbol}.")
-                continue
-            gemini_calls += 1
+            # Stage 2 — Gemini AI decision (fallback is automatic).
             social = get_social_context(symbol, social_snapshot)
             ai = await get_gemini_decision(symbol, result, social)
 

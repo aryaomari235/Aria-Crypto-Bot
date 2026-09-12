@@ -3,7 +3,7 @@ pandas
 matplotlib
 mplfinance
 python-telegram-bot[job-queue]
-google-generativeai
+google-genai
 textblob
 flask
 flask-cors
