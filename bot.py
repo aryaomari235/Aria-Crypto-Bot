@@ -1684,6 +1684,7 @@ def generate_gemini_reasoning(symbol, price, rsi, pattern, galaxy_score):
     Returns the model's stripped text, or a neutral fallback on ANY failure so
     analysis never crashes. Never raises.
     """
+    global gemini_client
     fallback = "Market shows mixed momentum; monitor key support and resistance levels carefully."
     if gemini_client is None:
         return fallback
